@@ -149,41 +149,7 @@ pub const BROTLI_ALIGNED_READ: u8 = 0;
 
 #[inline(always)]
 pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) {
-  if ::core::mem::size_of::<reg_t>() == 8 {
-    if (n_bits <= 8 && BROTLI_ALIGNED_READ == 0 && br.bit_pos_ >= 56) {
-      br.val_ >>= 56;
-      br.bit_pos_ ^= 56;  // here same as -= 56 because of the if condition
-      br.val_ |= BrotliLoad64LE(input, br.next_in) << 8;
-      br.avail_in -= 7;
-      br.next_in += 7;
-    } else if (BROTLI_ALIGNED_READ == 0 && n_bits <= 16 && br.bit_pos_ >= 48) {
-      br.val_ >>= 48;
-      br.bit_pos_ ^= 48;  // here same as -= 48 because of the if condition
-      br.val_ |= BrotliLoad64LE(input, br.next_in) << 16;
-      br.avail_in -= 6;
-      br.next_in += 6;
-    } else if br.bit_pos_ >= 32 {
-      br.val_ >>= 32;
-      br.bit_pos_ ^= 32;  /* here same as -= 32 because of the if condition */
-      br.val_ |= (BrotliLoad32LE(input, br.next_in) as reg_t) << 32;
-      br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-      br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-    }
-  } else if (BROTLI_ALIGNED_READ == 0 && (n_bits <= 8)) {
-    if (br.bit_pos_ >= 24) {
-      br.val_ >>= 24;
-      br.bit_pos_ ^= 24;  // here same as -= 24 because of the if condition
-      br.val_ |= (BrotliLoad32LE(input, br.next_in) << 8) as u64;
-      br.avail_in -= 3;
-      br.next_in += 3;
-    }
-  } else if br.bit_pos_ >= 16 {
-    br.val_ >>= 16;
-    br.bit_pos_ ^= 16;  /* here same as -= 16 because of the if condition */
-    br.val_ |= (BrotliLoad16LE(input, br.next_in) as reg_t) << 16;
-    br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-    br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-  }
+  BrotliFillBitWindowCompileTimeNbits(br, n_bits, input);
 }
 
 #[inline(always)]

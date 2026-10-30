@@ -733,6 +733,10 @@ pub(crate) fn copy_bytes(dst: &mut [u8], src: &[u8]) {
       dst[..8].copy_from_slice(&src[..8]);
       dst[n - 8..].copy_from_slice(&src[n - 8..]);
     }
+    17..=32 => {
+      dst[..16].copy_from_slice(&src[..16]);
+      dst[n - 16..].copy_from_slice(&src[n - 16..]);
+    }
     _ => dst.copy_from_slice(src),
   }
 }
