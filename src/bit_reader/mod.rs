@@ -9,10 +9,15 @@ macro_rules! xprintln (
   ($a : expr, $b : expr, $c : expr, $d : expr, $e : expr, $f : expr) => ();
 );
 
-pub const BROTLI_SHORT_FILL_BIT_WINDOW_READ: u32 = 4;
-
+#[cfg(any(target_pointer_width = "64", test))]
 #[allow(non_camel_case_types)]
 pub type reg_t = u64;
+
+#[cfg(not(any(target_pointer_width = "64", test)))]
+#[allow(non_camel_case_types)]
+pub type reg_t = u32;
+
+pub const BROTLI_SHORT_FILL_BIT_WINDOW_READ: u32 = (::core::mem::size_of::<reg_t>() >> 1) as u32;
 
 #[cfg(test)]
 mod regression_tests;
@@ -28,12 +33,20 @@ const kBitMask: [u32; 33] =
 
 // Equals kBitMask[n] for every n in 0..=32, the only values callers pass,
 // without the table load and its bounds check; C computes it the same way
-// wherever it has a bit-field extract instruction. Computed in 64 bits so that
-// n == 32 does not overflow, and n is masked so that no n can make the shift
-// overflow.
+// wherever it has a bit-field extract instruction. On 64-bit targets it is
+// computed in 64 bits so that n == 32 does not overflow; on 32-bit targets
+// reg_t is 32 bits wide and callers pass n <= 24 (or split reads > 16 into two
+// halves), so a 32-bit shift avoids a 64-bit shift sequence.
 #[inline(always)]
 pub fn BitMask(n: u32) -> u32 {
-  (!(u64::MAX << (n & 63))) as u32
+  #[cfg(any(target_pointer_width = "64", test))]
+  {
+    (!(u64::MAX << (n & 63))) as u32
+  }
+  #[cfg(not(any(target_pointer_width = "64", test)))]
+  {
+    !(u32::MAX << (n & 31))
+  }
 }
 
 pub struct BrotliBitReader {
@@ -123,13 +136,16 @@ pub fn BrotliCheckInputAmount(br: &BrotliBitReader, num: u32) -> bool {
 
 #[inline(always)]
 fn BrotliLoad16LE(input: &[u8], next_in_u32: u32) -> u16 {
-  let next_in: usize = next_in_u32 as usize;
-  (fast!((input)[next_in]) as u16) | ((fast!((input)[next_in + 1]) as u16) << 8)
+  match input.get(next_in_u32 as usize..) {
+    Some(&[a, b, ..]) => u16::from_le_bytes([a, b]),
+    _ => 0,
+  }
 }
 
 
 // from_le_bytes compiles to one unaligned load; assembling the value byte by
 // byte let LLVM split the load into pieces once callers shift out high bytes.
+#[allow(dead_code)]
 #[inline(always)]
 fn BrotliLoad32LE(input: &[u8], next_in_u32: u32) -> u32 {
   let next_in: usize = next_in_u32 as usize;
@@ -138,6 +154,7 @@ fn BrotliLoad32LE(input: &[u8], next_in_u32: u32) -> u32 {
   u32::from_le_bytes(four_byte)
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn BrotliLoad64LE(input: &[u8], next_in_u32: u32) -> u64 {
   let next_in: usize = next_in_u32 as usize;
@@ -145,6 +162,7 @@ fn BrotliLoad64LE(input: &[u8], next_in_u32: u32) -> u64 {
   eight_byte.clone_from_slice(fast!((input)[next_in ; next_in + 8]));
   u64::from_le_bytes(eight_byte)
 }
+#[allow(dead_code)]
 pub const BROTLI_ALIGNED_READ: u8 = 0;
 
 #[inline(always)]
@@ -155,46 +173,38 @@ pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) 
 #[inline(always)]
 fn BrotliFillBitWindowCompileTimeNbits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) {
   if ::core::mem::size_of::<reg_t>() == 8 {
-    if BROTLI_ALIGNED_READ == 0 && n_bits <= 8 {
-      // !BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 8)) {
-      if br.bit_pos_ >= 56 {
-        br.val_ >>= 56;
-        br.bit_pos_ ^= 56;  /* here same as -= 56 because of the if condition */
-        br.val_ |= BrotliLoad64LE(input, br.next_in) << 8;
-        br.avail_in -= 7;
-        br.next_in += 7;
+    #[cfg(any(target_pointer_width = "64", test))]
+    {
+      if BROTLI_ALIGNED_READ == 0 && n_bits <= 8 {
+        // !BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 8)) {
+        if br.bit_pos_ >= 56 {
+          br.val_ >>= 56;
+          br.bit_pos_ ^= 56;  /* here same as -= 56 because of the if condition */
+          br.val_ |= BrotliLoad64LE(input, br.next_in) << 8;
+          br.avail_in -= 7;
+          br.next_in += 7;
+        }
+      } else if BROTLI_ALIGNED_READ == 0 && n_bits <= 16 {
+        // (!BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 16)) {
+        if br.bit_pos_ >= 48 {
+          br.val_ >>= 48;
+          br.bit_pos_ ^= 48;  /* here same as -= 48 because of the if condition */
+          br.val_ |= BrotliLoad64LE(input, br.next_in) << 16;
+          br.avail_in -= 6;
+          br.next_in += 6;
+        }
+      } else if br.bit_pos_ >= 32 {
+        br.val_ >>= 32;
+        br.bit_pos_ ^= 32;  /* here same as -= 32 because of the if condition */
+        br.val_ |= (BrotliLoad32LE(input, br.next_in) as reg_t) << 32;
+        br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
+        br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
       }
-    } else if BROTLI_ALIGNED_READ == 0 && n_bits <= 16 {
-      // (!BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 16)) {
-      if br.bit_pos_ >= 48 {
-        br.val_ >>= 48;
-        br.bit_pos_ ^= 48;  /* here same as -= 48 because of the if condition */
-        br.val_ |= BrotliLoad64LE(input, br.next_in) << 16;
-        br.avail_in -= 6;
-        br.next_in += 6;
-      }
-    } else if br.bit_pos_ >= 32 {
-      br.val_ >>= 32;
-      br.bit_pos_ ^= 32;  /* here same as -= 32 because of the if condition */
-      br.val_ |= (BrotliLoad32LE(input, br.next_in) as reg_t) << 32;
-      br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-      br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
-    }
-  } else if
-      // BROTLI_ALIGNED_READ == false &&
-      n_bits <= 8 {
-    // !BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 8)) {
-    if br.bit_pos_ >= 24 {
-      br.val_ >>= 24;
-      br.bit_pos_ ^= 24;  /* here same as -= 24 because of the if condition */
-      br.val_ |= (BrotliLoad32LE(input, br.next_in) as reg_t) << 8;
-      br.avail_in -= 3;
-      br.next_in += 3;
     }
   } else if br.bit_pos_ >= 16 {
-      br.val_ >>= 16;
-      br.bit_pos_ ^= 16;  /* here same as -= 16 because of the if condition */
-      br.val_ |= (BrotliLoad16LE(input, br.next_in) as reg_t) << 16;
+      let next = BrotliLoad16LE(input, br.next_in) as reg_t;
+      br.val_ = (br.val_ >> 16) | (next << 16);
+      br.bit_pos_ &= 15;  /* here same as -= 16 because 16 <= br.bit_pos_ < 32 */
       br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
       br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
   }
@@ -212,11 +222,7 @@ pub fn BrotliPullByte(br: &mut BrotliBitReader, input: &[u8]) -> bool {
     return false;
   }
   br.val_ >>= 8;
-  if ::core::mem::size_of::<reg_t>() == 8 {
-    br.val_ |= (fast!((input)[br.next_in as usize]) as reg_t) << 56;
-  } else {
-    br.val_ |= (fast!((input)[br.next_in as usize]) as reg_t) << 24;
-  }
+  br.val_ |= (fast!((input)[br.next_in as usize]) as reg_t) << ((::core::mem::size_of::<reg_t>() << 3) - 8);
   br.bit_pos_ -= 8;
   br.avail_in -= 1;
   br.next_in += 1;
@@ -316,7 +322,7 @@ pub fn BrotliReadBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u3
     val
   } else if n_bits <= 16 {
     let mut val: u32 = 0;
-    BrotliFillBitWindow(br, n_bits, input);
+    BrotliFillBitWindowCompileTimeNbits(br, 16, input);
     BrotliTakeBits(br, n_bits, &mut val);
     val
   } else {
@@ -324,7 +330,7 @@ pub fn BrotliReadBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u3
     let mut high_val: u32 = 0;
     BrotliFillBitWindowCompileTimeNbits(br, 16, input);
     BrotliTakeBits(br, 16, &mut low_val);
-    BrotliFillBitWindowCompileTimeNbits(br, 8, input);
+    BrotliFillBitWindowCompileTimeNbits(br, 16, input);
     BrotliTakeBits(br, n_bits - 16, &mut high_val);
     low_val | (high_val << 16)
   }
@@ -350,6 +356,25 @@ pub fn BrotliReadConstantNBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u
   }
 }
 
+#[cold]
+#[inline(never)]
+fn BrotliSafeReadBits32Slow(br: &mut BrotliBitReader,
+                            n_bits: u32,
+                            val: &mut u32,
+                            input: &[u8])
+                            -> bool {
+  let mut low_val: u32 = 0;
+  let mut high_val: u32 = 0;
+  let memento = BrotliBitReaderSaveState(br);
+  if !BrotliSafeReadBits(br, 16, &mut low_val, input) ||
+     !BrotliSafeReadBits(br, n_bits - 16, &mut high_val, input) {
+    BrotliBitReaderRestoreState(br, &memento);
+    return false;
+  }
+  *val = low_val | (high_val << 16);
+  true
+}
+
 // Tries to read the specified amount of bits. Returns 0, if there is not
 // enough input. n_bits MUST be positive.
 pub fn BrotliSafeReadBits(br: &mut BrotliBitReader,
@@ -357,6 +382,9 @@ pub fn BrotliSafeReadBits(br: &mut BrotliBitReader,
                           val: &mut u32,
                           input: &[u8])
                           -> bool {
+  if ::core::mem::size_of::<reg_t>() < 8 && n_bits > 24 {
+    return BrotliSafeReadBits32Slow(br, n_bits, val, input);
+  }
   while BrotliGetAvailableBits(br) < n_bits {
     if !BrotliPullByte(br, input) {
       return false;

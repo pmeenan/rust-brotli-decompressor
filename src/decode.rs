@@ -374,6 +374,21 @@ fn DecodeMetaBlockLength<AllocU8: alloc::Allocator<u8>,
     }
   }
 }
+#[inline(always)]
+fn load_huffman_code(table: &[HuffmanCode], idx: usize) -> HuffmanCode {
+  #[cfg(any(target_pointer_width = "64", test))]
+  {
+    fast!((table)[idx])
+  }
+  #[cfg(not(any(target_pointer_width = "64", test)))]
+  {
+    match table.get(idx) {
+      Some(&e) => e,
+      None => HuffmanCode { value: 0, bits: 0 },
+    }
+  }
+}
+
 // Decodes the Huffman code.
 // This method doesn't read data from the bit reader, BUT drops the amount of
 // bits that correspond to the decoded symbol.
@@ -381,15 +396,16 @@ fn DecodeMetaBlockLength<AllocU8: alloc::Allocator<u8>,
 #[inline(always)]
 fn DecodeSymbol(bits: u32, table: &[HuffmanCode], br: &mut bit_reader::BrotliBitReader) -> u32 {
   let mut table_index = bits & HUFFMAN_TABLE_MASK;
-  let mut table_element = fast!((table)[table_index as usize]);
+  let mut table_element = load_huffman_code(table, table_index as usize);
   if table_element.bits > HUFFMAN_TABLE_BITS as u8 {
     mark_unlikely();
     let nbits = table_element.bits - HUFFMAN_TABLE_BITS as u8;
     bit_reader::BrotliDropBits(br, HUFFMAN_TABLE_BITS);
     table_index += table_element.value as u32;
-    table_element = fast!((table)[(table_index
-                           + ((bits >> HUFFMAN_TABLE_BITS)
-                              & bit_reader::BitMask(nbits as u32))) as usize]);
+    let ext_idx = (table_index
+                   + ((bits >> HUFFMAN_TABLE_BITS)
+                      & bit_reader::BitMask(nbits as u32))) as usize;
+    table_element = load_huffman_code(table, ext_idx);
   }
   bit_reader::BrotliDropBits(br, table_element.bits as u32);
   table_element.value as u32
@@ -472,8 +488,8 @@ fn PreloadSymbol(safe: bool,
   if (safe) {
     return;
   }
-  let table_element =
-    fast!((table)[bit_reader::BrotliGetBits(br, HUFFMAN_TABLE_BITS, input) as usize]);
+  let idx = bit_reader::BrotliGetBits(br, HUFFMAN_TABLE_BITS, input) as usize;
+  let table_element = load_huffman_code(table, idx);
   *bits = table_element.bits as u32;
   *value = table_element.value as u32;
 }
@@ -494,7 +510,7 @@ fn ReadPreloadedSymbol(table: &[HuffmanCode],
     let mask = bit_reader::BitMask((*bits - HUFFMAN_TABLE_BITS));
     bit_reader::BrotliDropBits(br, HUFFMAN_TABLE_BITS);
     ext_index += (val >> HUFFMAN_TABLE_BITS) & mask;
-    let ext = fast!((table)[ext_index as usize]);
+    let ext = load_huffman_code(table, ext_index as usize);
     bit_reader::BrotliDropBits(br, ext.bits as u32);
     ext.value as u32
   } else {
@@ -698,7 +714,8 @@ fn ReadSymbolCodeLengths<AllocU8: alloc::Allocator<u8>,
     bit_reader::BrotliFillBitWindow16(&mut s.br, input);
     p_index +=
       bit_reader::BrotliGetBitsUnmasked(&s.br) &
-      bit_reader::BitMask(huffman::BROTLI_HUFFMAN_MAX_CODE_LENGTH_CODE_LENGTH as u32) as u64;
+      bit_reader::BitMask(huffman::BROTLI_HUFFMAN_MAX_CODE_LENGTH_CODE_LENGTH as u32)
+        as bit_reader::reg_t;
     let p = fast!((s.table)[p_index as usize]);
     bit_reader::BrotliDropBits(&mut s.br, p.bits as u32); /* Use 1..5 bits */
     code_len = p.value as u32; /* code_len == 0..17 */
@@ -3004,9 +3021,10 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
       bit_reader::BrotliDropBits(&mut s.br, HUFFMAN_TABLE_BITS);
       table_index += table_element.value as u32;
       let distance_tree = huffman_tree(distance_hgroup, s.dist_htree_index as usize);
-      table_element = fast!((distance_tree)[(table_index
-                             + ((bits >> HUFFMAN_TABLE_BITS)
-                                & bit_reader::BitMask(nbits as u32))) as usize]);
+      let ext_idx = (table_index
+                     + ((bits >> HUFFMAN_TABLE_BITS)
+                        & bit_reader::BitMask(nbits as u32))) as usize;
+      table_element = load_huffman_code(distance_tree, ext_idx);
     }
     bit_reader::BrotliDropBits(&mut s.br, table_element.bits as u32);
     s.distance_code = table_element.value as i32;
@@ -3025,7 +3043,7 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
   // Convert the distance code to the actual distance by possibly
   // looking up past distances from the s.ringbuffer.
   s.distance_context = 0;
-  if ((s.distance_code as u64 & 0xfffffffffffffff0) == 0) {
+  if ((s.distance_code as u32) < (NUM_DISTANCE_SHORT_CODES as u32)) {
     TakeDistanceFromRingBuffer(s);
     fast_mut!((s.block_type_length_state.block_length)[2]) -= 1;
     return true;
@@ -3034,12 +3052,13 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
   if (distval >= 0) {
     let nbits: u32;
     let postfix: i32;
-    let offset: i32;
+    let offset: u32;
     if (!safe && (s.distance_postfix_bits == 0)) {
       nbits = (distval as u32 >> 1) + 1;
-      offset = ((2 + (distval & 1)) << nbits) - 4;
-      s.distance_code = (s.num_direct_distance_codes as i64 + offset as i64 +
-                        bit_reader::BrotliReadBits(&mut s.br, nbits, input) as i64) as i32;
+      offset = ((((distval & 1) as u32).wrapping_add(2)) << nbits).wrapping_sub(4);
+      s.distance_code = s.num_direct_distance_codes
+        .wrapping_add(offset)
+        .wrapping_add(bit_reader::BrotliReadBits(&mut s.br, nbits, input)) as i32;
     } else {
       // This branch also works well when s.distance_postfix_bits == 0
       let mut bits: u32 = 0;
@@ -3055,8 +3074,12 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
       } else {
         bits = bit_reader::BrotliReadBits(&mut s.br, nbits, input);
       }
-      offset = (((distval & 1).wrapping_add(2)) << nbits).wrapping_sub(4);
-      s.distance_code = ((i64::from(offset) + i64::from(bits)) << s.distance_postfix_bits).wrapping_add(i64::from(postfix)).wrapping_add(i64::from(s.num_direct_distance_codes)) as i32;
+      offset = ((((distval & 1) as u32).wrapping_add(2)) << nbits).wrapping_sub(4);
+      s.distance_code = offset
+        .wrapping_add(bits)
+        .wrapping_shl(s.distance_postfix_bits)
+        .wrapping_add(postfix as u32)
+        .wrapping_add(s.num_direct_distance_codes) as i32;
     }
   }
   s.distance_code = s.distance_code.wrapping_sub(NUM_DISTANCE_SHORT_CODES as i32).wrapping_add(1);
@@ -3140,35 +3163,50 @@ fn memmove16(data: &mut [u8], u32off_dst: u32, u32off_src: u32) -> bool {
   // Always copies 16 bytes, so a caller copying fewer overshoots; the ring buffer
   // carries kRingBufferWriteAheadSlack bytes past ringbuffer_size to absorb it.
   // Subtraction, not `off + 16`, so nothing can wrap.
-  let len = data.len();
-  if len < 16 || core::cmp::max(off_dst, off_src) > len - 16 {
-    return false;
+  #[cfg(any(target_pointer_width = "64", test))]
+  {
+    let len = data.len();
+    if len < 16 || core::cmp::max(off_dst, off_src) > len - 16 {
+      return false;
+    }
+    let dst_end = off_dst + 16;
+    let src_end = off_src + 16;
+    let mut local_array: [u8; 16] = fast_uninitialized!(16);
+    local_array.clone_from_slice(&data[off_src..src_end]);
+    data[off_dst..dst_end].clone_from_slice(&local_array);
+    true
   }
-  let dst_end = off_dst + 16;
-  let src_end = off_src + 16;
-  // data[off_dst + 15] = data[off_src + 15];
-  // data[off_dst + 14] = data[off_src + 14];
-  // data[off_dst + 13] = data[off_src + 13];
-  // data[off_dst + 12] = data[off_src + 12];
-  //
-  // data[off_dst + 11] = data[off_src + 11];
-  // data[off_dst + 10] = data[off_src + 10];
-  // data[off_dst + 9] = data[off_src + 9];
-  // data[off_dst + 8] = data[off_src + 8];
-  //
-  // data[off_dst + 7] = data[off_src + 7];
-  // data[off_dst + 6] = data[off_src + 6];
-  // data[off_dst + 5] = data[off_src + 5];
-  // data[off_dst + 4] = data[off_src + 4];
-  //
-  // data[off_dst + 3] = data[off_src + 3];
-  // data[off_dst + 2] = data[off_src + 2];
-  // data[off_dst + 1] = data[off_src + 1];
-  //
-  let mut local_array: [u8; 16] = fast_uninitialized!(16);
-  local_array.clone_from_slice(&data[off_src..src_end]);
-  data[off_dst..dst_end].clone_from_slice(&local_array);
-  true
+  #[cfg(not(any(target_pointer_width = "64", test)))]
+  {
+    let local_array: [u8; 16] = match data.get(off_src..) {
+      Some(&[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, ..]) => {
+        [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15]
+      }
+      _ => return false,
+    };
+    match data.get_mut(off_dst..) {
+      Some([d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15, ..]) => {
+        *d0 = local_array[0];
+        *d1 = local_array[1];
+        *d2 = local_array[2];
+        *d3 = local_array[3];
+        *d4 = local_array[4];
+        *d5 = local_array[5];
+        *d6 = local_array[6];
+        *d7 = local_array[7];
+        *d8 = local_array[8];
+        *d9 = local_array[9];
+        *d10 = local_array[10];
+        *d11 = local_array[11];
+        *d12 = local_array[12];
+        *d13 = local_array[13];
+        *d14 = local_array[14];
+        *d15 = local_array[15];
+        true
+      }
+      _ => false,
+    }
+  }
 }
 
 #[inline(always)]
@@ -3201,14 +3239,35 @@ fn memcpy_within_slice(data: &mut [u8], off_dst: usize, off_src: usize, size: us
 
   #[cfg(not(feature="unsafe"))]
   {
-    if off_dst > off_src {
-      let (src, dst) = data.split_at_mut(off_dst);
-      let src_slice = fast!((src)[off_src ; off_src + size]);
-      fast_mut!((dst)[0;size]).clone_from_slice(src_slice);
-    } else {
-      let (dst, src) = data.split_at_mut(off_src);
-      let src_slice = fast!((src)[0;size]);
-      fast_mut!((dst)[off_dst;off_dst + size]).clone_from_slice(src_slice);
+    #[cfg(not(any(target_pointer_width = "64", test)))]
+    {
+      if off_dst > off_src {
+        let (src, dst) = data.split_at_mut(off_dst);
+        if let (Some(src_slice), Some(dst_slice)) =
+          (src.get(off_src..).and_then(|s| s.get(..size)), dst.get_mut(..size))
+        {
+          dst_slice.copy_from_slice(src_slice);
+        }
+      } else {
+        let (dst, src) = data.split_at_mut(off_src);
+        if let (Some(src_slice), Some(dst_slice)) =
+          (src.get(..size), dst.get_mut(off_dst..).and_then(|d| d.get_mut(..size)))
+        {
+          dst_slice.copy_from_slice(src_slice);
+        }
+      }
+    }
+    #[cfg(any(target_pointer_width = "64", test))]
+    {
+      if off_dst > off_src {
+        let (src, dst) = data.split_at_mut(off_dst);
+        let src_slice = fast!((src)[off_src ; off_src + size]);
+        fast_mut!((dst)[0;size]).clone_from_slice(src_slice);
+      } else {
+        let (dst, src) = data.split_at_mut(off_src);
+        let src_slice = fast!((src)[0;size]);
+        fast_mut!((dst)[off_dst;off_dst + size]).clone_from_slice(src_slice);
+      }
     }
   }
 
