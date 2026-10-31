@@ -843,13 +843,15 @@ impl <'brotli_state,
                               AllocHC::AllocatedMemory::default()));
       self.alloc_u8.free_cell(core::mem::replace(&mut self.custom_dict,
                               AllocU8::AllocatedMemory::default()));
-      for chunk in self.compound_dictionary.chunks.iter_mut() {
+      let num_chunks = self.compound_dictionary.num_chunks.min(self.compound_dictionary.chunks.len());
+      for chunk in self.compound_dictionary.chunks[..num_chunks].iter_mut() {
         if let MaybeOwnedSlice::Owned(mem) =
             core::mem::replace(chunk, MaybeOwnedSlice::default()) {
           self.alloc_u8.free_cell(mem);
         }
       }
-      self.compound_dictionary = BrotliDecoderCompoundDictionary::default();
+      self.compound_dictionary.num_chunks = 0;
+      self.compound_dictionary.total_size = 0;
       if let MaybeOwnedSlice::Owned(mem) =
           core::mem::replace(&mut self.dictionary.blob, MaybeOwnedSlice::default()) {
         self.alloc_u8.free_cell(mem);

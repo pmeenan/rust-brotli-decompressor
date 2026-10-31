@@ -9,48 +9,51 @@ use std::vec::Vec;
 pub use std::boxed::Box;
 
 #[cfg(feature="std")]
-pub struct MemoryBlock<Ty:Sized+Default>(Box<[Ty]>);
+pub struct MemoryBlock<Ty:Sized+Default> {
+    inner: core::mem::ManuallyDrop<Box<[Ty]>>,
+}
+#[cfg(feature="std")]
+#[allow(non_snake_case)]
+#[inline(always)]
+fn MemoryBlock<Ty:Sized+Default>(b: Box<[Ty]>) -> MemoryBlock<Ty> {
+    MemoryBlock {
+        inner: core::mem::ManuallyDrop::new(b),
+    }
+}
 #[cfg(feature="std")]
 impl<Ty:Sized+Default> Default for MemoryBlock<Ty> {
+    #[inline(always)]
     fn default() -> Self {
         MemoryBlock(Vec::<Ty>::new().into_boxed_slice())
     }
 }
 #[cfg(feature="std")]
 impl<Ty:Sized+Default> alloc::SliceWrapper<Ty> for MemoryBlock<Ty> {
+    #[inline(always)]
     fn slice(&self) -> &[Ty] {
-        &self.0[..]
+        &self.inner[..]
     }
 }
 #[cfg(feature="std")]
 impl<Ty:Sized+Default> alloc::SliceWrapperMut<Ty> for MemoryBlock<Ty> {
+    #[inline(always)]
     fn slice_mut(&mut self) -> &mut [Ty] {
-        &mut self.0[..]
+        &mut self.inner[..]
     }
 }
 #[cfg(feature="std")]
 impl<Ty:Sized+Default> core::ops::Index<usize> for MemoryBlock<Ty> {
     type Output = Ty;
+    #[inline(always)]
     fn index(&self, index:usize) -> &Ty {
-        &self.0[index]
+        &self.inner[index]
     }
 }
 #[cfg(feature="std")]
 impl<Ty:Sized+Default> core::ops::IndexMut<usize> for MemoryBlock<Ty> {
-
+    #[inline(always)]
     fn index_mut(&mut self, index:usize) -> &mut Ty {
-        &mut self.0[index]
-    }
-}
-#[cfg(feature="std")]
-impl<Ty:Sized+Default> Drop for MemoryBlock<Ty> {
-    fn drop (&mut self) {
-        if self.0.len() != 0 {
-            print!("leaking memory block of length {} element size: {}\n", self.0.len(), core::mem::size_of::<Ty>());
-
-            let to_forget = core::mem::replace(self, MemoryBlock::default());
-            core::mem::forget(to_forget);// leak it -- it's the only safe way with custom allocators
-        }
+        &mut self.inner[index]
     }
 }
 
@@ -143,16 +146,17 @@ impl<Ty:Sized+Default+Clone> alloc::Allocator<Ty> for SubclassableAllocator {
             None => MemoryBlock::<Ty>::default(),
         }
     }
+    #[inline(always)]
     fn free_cell(&mut self, mut bv:MemoryBlock<Ty>) {
-        if (*bv.0).len() != 0 {
+        if (*bv.inner).len() != 0 {
             if let Some(_) = self.alloc.alloc_func {
-                let slice_ptr = (*bv.0).as_mut_ptr();
-                let _box_ptr = Box::into_raw(core::mem::replace(&mut bv.0, Vec::<Ty>::new().into_boxed_slice()));
+                let slice_ptr = (*bv.inner).as_mut_ptr();
+                let _box_ptr = Box::into_raw(core::mem::replace(&mut *bv.inner, Vec::<Ty>::new().into_boxed_slice()));
                 if let Some(free_fn) = self.alloc.free_func {
                     unsafe {free_fn(self.alloc.opaque, core::mem::transmute::<*mut Ty, *mut c_void>(slice_ptr))};
                 }
             } else {
-                let _to_free = core::mem::replace(&mut bv.0, Vec::<Ty>::new().into_boxed_slice());
+                let _to_free = core::mem::replace(&mut *bv.inner, Vec::<Ty>::new().into_boxed_slice());
             }
         }
     }
