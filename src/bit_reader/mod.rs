@@ -9,11 +9,11 @@ macro_rules! xprintln (
   ($a : expr, $b : expr, $c : expr, $d : expr, $e : expr, $f : expr) => ();
 );
 
-#[cfg(any(target_pointer_width = "64", test))]
+#[cfg(target_pointer_width = "64")]
 #[allow(non_camel_case_types)]
 pub type reg_t = u64;
 
-#[cfg(not(any(target_pointer_width = "64", test)))]
+#[cfg(not(target_pointer_width = "64"))]
 #[allow(non_camel_case_types)]
 pub type reg_t = u32;
 
@@ -31,20 +31,24 @@ const kBitMask: [u32; 33] =
    0x00FFFFFF, 0x01FFFFFF, 0x03FFFFFF, 0x07FFFFFF, 0x0FFFFFFF, 0x1FFFFFFF, 0x3FFFFFFF, 0x7FFFFFFF,
    0xFFFFFFFF];
 
-// Equals kBitMask[n] for every n in 0..=32, the only values callers pass,
-// without the table load and its bounds check; C computes it the same way
-// wherever it has a bit-field extract instruction. On 64-bit targets it is
-// computed in 64 bits so that n == 32 does not overflow; on 32-bit targets
-// reg_t is 32 bits wide and callers pass n <= 24 (or split reads > 16 into two
-// halves), so a 32-bit shift avoids a 64-bit shift sequence.
+// Equals kBitMask[n] without the table load and its bounds check; C computes
+// it the same way wherever it has a bit-field extract instruction.
+// On 64-bit targets it is computed in 64 bits, so it holds for every n in
+// 0..=32. On 32-bit targets a 64-bit shift is a multi-instruction sequence,
+// and making n == 32 work costs the hot paths an extra compare and select
+// (+1.4% instructions on Cortex-A53), so it holds for n in 0..=31 only: the
+// 32-bit reader never needs a 32-bit mask, as it splits reads wider than 16
+// bits into two (`BrotliReadBits`, `BrotliSafeReadBits32Slow`) and peeks at
+// most 16 bits.
 #[inline(always)]
 pub fn BitMask(n: u32) -> u32 {
-  #[cfg(any(target_pointer_width = "64", test))]
+  #[cfg(target_pointer_width = "64")]
   {
     (!(u64::MAX << (n & 63))) as u32
   }
-  #[cfg(not(any(target_pointer_width = "64", test)))]
+  #[cfg(not(target_pointer_width = "64"))]
   {
+    debug_assert!(n < 32, "BitMask({}) on a 32-bit target", n);
     !(u32::MAX << (n & 31))
   }
 }
@@ -135,10 +139,15 @@ pub fn BrotliCheckInputAmount(br: &BrotliBitReader, num: u32) -> bool {
 
 
 #[inline(always)]
+// Callers refill only when the caller checked enough input is available, so
+// the zero fallback is unreachable; it replaces a panicking index.
 fn BrotliLoad16LE(input: &[u8], next_in_u32: u32) -> u16 {
   match input.get(next_in_u32 as usize..) {
     Some(&[a, b, ..]) => u16::from_le_bytes([a, b]),
-    _ => 0,
+    _ => {
+      debug_assert!(false, "BrotliLoad16LE past the end of the input");
+      0
+    }
   }
 }
 
@@ -172,8 +181,11 @@ pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) 
 
 #[inline(always)]
 fn BrotliFillBitWindowCompileTimeNbits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) {
+  // The 32-bit register always refills 16 bits, whatever `n_bits` is.
+  #[cfg(not(target_pointer_width = "64"))]
+  let _ = n_bits;
   if ::core::mem::size_of::<reg_t>() == 8 {
-    #[cfg(any(target_pointer_width = "64", test))]
+    #[cfg(target_pointer_width = "64")]
     {
       if BROTLI_ALIGNED_READ == 0 && n_bits <= 8 {
         // !BROTLI_ALIGNED_READ && IS_CONSTANT(n_bits) && (n_bits <= 8)) {
@@ -483,7 +495,9 @@ mod tests {
 
   #[test]
   fn bit_mask_matches_the_table() {
-    for n in 0..kBitMask.len() as u32 {
+    // 32-bit targets support n <= 31 only; see `BitMask`.
+    let max = if ::core::mem::size_of::<reg_t>() == 8 { 32 } else { 31 };
+    for n in 0..max + 1 {
       assert_eq!(BitMask(n), kBitMask[n as usize]);
     }
   }
@@ -535,6 +549,9 @@ mod tests {
     assert_eq!(BrotliPeekByte(&mut out_of_bounds_reader, 0, &data), -1);
   }
 
+  // Hard-coded vectors for the 64-bit register; regression_tests.rs
+  // checks both register widths against a bit-at-a-time oracle.
+  #[cfg(target_pointer_width = "64")]
   #[test]
   fn warmup_works() {
     let data: [u8; 37] = [0xde, 0xad, 0xbe, 0xef /* 4 bytes garbage at beginning */, 0x21,
@@ -554,6 +571,9 @@ mod tests {
     assert_eq!(bit_reader.avail_in, 32);
     assert_eq!(bit_reader.next_in, 5);
   }
+  // Hard-coded vectors for the 64-bit register; regression_tests.rs
+  // checks both register widths against a bit-at-a-time oracle.
+  #[cfg(target_pointer_width = "64")]
   #[test]
   fn warmup_errcheck() {
     let data: [u8; 3] = [0xde, 0xad, 0xeb]; // 3 bytes garbage at beginning
@@ -570,6 +590,9 @@ mod tests {
     assert_eq!(bit_reader.avail_in, 0);
     assert_eq!(bit_reader.next_in, 3);
   }
+  // Hard-coded vectors for the 64-bit register; regression_tests.rs
+  // checks both register widths against a bit-at-a-time oracle.
+  #[cfg(target_pointer_width = "64")]
   #[test]
   fn safe_read_tests() {
     {
@@ -639,6 +662,9 @@ mod tests {
       assert_eq!(val, 0x74eca3f0);
     }
   }
+  // Hard-coded vectors for the 64-bit register; regression_tests.rs
+  // checks both register widths against a bit-at-a-time oracle.
+  #[cfg(target_pointer_width = "64")]
   #[test]
   fn bit_read_tests() {
     {
@@ -674,6 +700,9 @@ mod tests {
       assert_eq!(bit_reader.next_in, 4);
     }
   }
+  // Hard-coded vectors for the 64-bit register; regression_tests.rs
+  // checks both register widths against a bit-at-a-time oracle.
+  #[cfg(target_pointer_width = "64")]
   #[test]
   fn const_fill_bit_window_tests() {
     {

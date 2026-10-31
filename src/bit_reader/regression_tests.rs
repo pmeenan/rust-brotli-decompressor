@@ -25,6 +25,13 @@ fn pattern(input: &mut [u8], mut seed: u32) {
   }
 }
 
+// Width of the bit register in bytes: 8 on 64-bit targets, 4 on 32-bit ones.
+const REG_BYTES: usize = ::core::mem::size_of::<reg_t>();
+
+// Widest read that `BrotliGetBits` / `BrotliReadConstantNBits` can serve from
+// one refill: 32 bits with a 64-bit register, 16 with a 32-bit one.
+const MAX_PEEK_BITS: u32 = if REG_BYTES == 8 { 32 } else { 16 };
+
 fn consumed_bits(reader: &BrotliBitReader) -> usize {
   reader.next_in as usize * 8 - BrotliGetAvailableBits(reader) as usize
 }
@@ -55,14 +62,14 @@ fn variable_reads_match_reference_bits_and_cursors() {
     pattern(&mut storage, seed);
     for alignment in 0..8 {
       let input = &storage[alignment..];
-      // Fast reads require a warmed-up register (bit_pos < 64).
-      for position in 0..64 {
+      // Fast reads require a warmed-up register (bit_pos < register width).
+      for position in 0..(REG_BYTES as u32 * 8) {
         for count in 0..33 {
           let mut reader = BrotliBitReader {
-            val_: reference_word(&input[..8]),
+            val_: reference_word(&input[..REG_BYTES]) as reg_t,
             bit_pos_: position,
-            next_in: 8,
-            avail_in: input.len() as u32 - 8,
+            next_in: REG_BYTES as u32,
+            avail_in: (input.len() - REG_BYTES) as u32,
           };
           let expected = reference_bits(input, position as usize, count);
           assert_eq!(
@@ -118,7 +125,7 @@ fn mixed_reads_preserve_bits_across_refills_unload_and_safe_tail() {
       let expected = reference_bits(input, position, count);
       let saved = BrotliBitReaderSaveState(&reader);
       let value = if reader.avail_in >= 8 {
-        match step % 3 {
+        match if count <= MAX_PEEK_BITS { step % 3 } else { 0 } {
           0 => BrotliReadBits(&mut reader, count, input),
           1 => BrotliReadConstantNBits(&mut reader, count, input),
           _ => {

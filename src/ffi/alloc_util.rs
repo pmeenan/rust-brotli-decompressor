@@ -8,9 +8,22 @@ use std::vec::Vec;
 #[cfg(feature="std")]
 pub use std::boxed::Box;
 
+// The block is `ManuallyDrop`: blocks from a custom allocator must go back
+// through `free_cell` (dropping them would hand them to the wrong allocator),
+// so one that is dropped instead leaks, as before. Without a release-build
+// `Drop` impl the decoder state has no drop glue to run on every block.
 #[cfg(feature="std")]
 pub struct MemoryBlock<Ty:Sized+Default> {
     inner: core::mem::ManuallyDrop<Box<[Ty]>>,
+}
+// Debug builds keep the upstream diagnostic for blocks leaked that way.
+#[cfg(all(feature="std", debug_assertions))]
+impl<Ty:Sized+Default> Drop for MemoryBlock<Ty> {
+    fn drop(&mut self) {
+        if self.inner.len() != 0 {
+            print!("leaking memory block of length {} element size: {}\n", self.inner.len(), core::mem::size_of::<Ty>());
+        }
+    }
 }
 #[cfg(feature="std")]
 #[allow(non_snake_case)]

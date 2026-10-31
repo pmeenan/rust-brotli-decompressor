@@ -376,15 +376,20 @@ fn DecodeMetaBlockLength<AllocU8: alloc::Allocator<u8>,
 }
 #[inline(always)]
 fn load_huffman_code(table: &[HuffmanCode], idx: usize) -> HuffmanCode {
-  #[cfg(any(target_pointer_width = "64", test))]
+  #[cfg(target_pointer_width = "64")]
   {
     fast!((table)[idx])
   }
-  #[cfg(not(any(target_pointer_width = "64", test)))]
+  #[cfg(not(target_pointer_width = "64"))]
   {
+    // Table builders fill every entry a valid code can reach, so the fallback
+    // is unreachable; it avoids a panic path in the hot loop.
     match table.get(idx) {
       Some(&e) => e,
-      None => HuffmanCode { value: 0, bits: 0 },
+      None => {
+        debug_assert!(false, "Huffman table index {} out of range", idx);
+        HuffmanCode { value: 0, bits: 0 }
+      }
     }
   }
 }
@@ -3163,7 +3168,7 @@ fn memmove16(data: &mut [u8], u32off_dst: u32, u32off_src: u32) -> bool {
   // Always copies 16 bytes, so a caller copying fewer overshoots; the ring buffer
   // carries kRingBufferWriteAheadSlack bytes past ringbuffer_size to absorb it.
   // Subtraction, not `off + 16`, so nothing can wrap.
-  #[cfg(any(target_pointer_width = "64", test))]
+  #[cfg(target_pointer_width = "64")]
   {
     let len = data.len();
     if len < 16 || core::cmp::max(off_dst, off_src) > len - 16 {
@@ -3176,7 +3181,7 @@ fn memmove16(data: &mut [u8], u32off_dst: u32, u32off_src: u32) -> bool {
     data[off_dst..dst_end].clone_from_slice(&local_array);
     true
   }
-  #[cfg(not(any(target_pointer_width = "64", test)))]
+  #[cfg(not(target_pointer_width = "64"))]
   {
     let local_array: [u8; 16] = match data.get(off_src..) {
       Some(&[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, ..]) => {
@@ -3239,25 +3244,25 @@ fn memcpy_within_slice(data: &mut [u8], off_dst: usize, off_src: usize, size: us
 
   #[cfg(not(feature="unsafe"))]
   {
-    #[cfg(not(any(target_pointer_width = "64", test)))]
+    #[cfg(not(target_pointer_width = "64"))]
     {
       if off_dst > off_src {
         let (src, dst) = data.split_at_mut(off_dst);
-        if let (Some(src_slice), Some(dst_slice)) =
-          (src.get(off_src..).and_then(|s| s.get(..size)), dst.get_mut(..size))
-        {
-          dst_slice.copy_from_slice(src_slice);
+        match (src.get(off_src..).and_then(|s| s.get(..size)), dst.get_mut(..size)) {
+          (Some(src_slice), Some(dst_slice)) => dst_slice.copy_from_slice(src_slice),
+          // Unreachable after the range checks above.
+          _ => return false,
         }
       } else {
         let (dst, src) = data.split_at_mut(off_src);
-        if let (Some(src_slice), Some(dst_slice)) =
-          (src.get(..size), dst.get_mut(off_dst..).and_then(|d| d.get_mut(..size)))
-        {
-          dst_slice.copy_from_slice(src_slice);
+        match (src.get(..size), dst.get_mut(off_dst..).and_then(|d| d.get_mut(..size))) {
+          (Some(src_slice), Some(dst_slice)) => dst_slice.copy_from_slice(src_slice),
+          // Unreachable after the range checks above.
+          _ => return false,
         }
       }
     }
-    #[cfg(any(target_pointer_width = "64", test))]
+    #[cfg(target_pointer_width = "64")]
     {
       if off_dst > off_src {
         let (src, dst) = data.split_at_mut(off_dst);
@@ -3370,6 +3375,43 @@ static EMPTY_COMMAND_TREE: CommandTree = [HuffmanCode { value: 0, bits: 0 }; kCo
 static EMPTY_HUFFMAN_ROOT: HuffmanRootTable =
   [HuffmanCode { value: 0, bits: 0 }; kHuffmanRootTableSize];
 
+// HuffmanTreeGroupDecode reserves BrotliHuffmanMaxTableSize(alphabet) entries
+// at every tree's offset (`ensure_codes_room`), and these sizes are exactly
+// that for the literal and insert-and-copy alphabets, so the fixed-size views
+// below always exist for an index a stream can produce: context map values and
+// block types are below the group's tree count. The empty-tree fallbacks are
+// unreachable; they keep panic paths out of the hot loop.
+const _LITERAL_TREE_IS_MAX_TABLE_SIZE: [(); kLiteralMaxTableSize] =
+  [(); huffman::BrotliHuffmanMaxTableSize(kNumLiteralCodes)];
+const _COMMAND_TREE_IS_MAX_TABLE_SIZE: [(); kCommandMaxTableSize] =
+  [(); huffman::BrotliHuffmanMaxTableSize(kNumInsertAndCopyCodes)];
+
+// Whether a decoded group's storage guarantees `len` entries at tree `index`
+// (see above). Hand-built states in tests, and lookups made ahead of use when
+// `ProcessCommandsInternal` resumes, can ask for trees it doesn't guarantee.
+#[inline(always)]
+fn tree_entries_guaranteed<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocator<HuffmanCode>>(
+  group: &HuffmanTreeGroup<AllocU32, AllocHC>,
+  index: usize,
+  len: usize,
+) -> bool {
+  index < group.num_htrees as usize && group.max_table_size() >= len
+}
+
+// The first `len` entries of the tree with the given index in a group, if the
+// group has that tree and that many entries from its offset.
+#[inline(always)]
+fn tree_entries<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocator<HuffmanCode>>(
+  group: &HuffmanTreeGroup<AllocU32, AllocHC>,
+  index: usize,
+  len: usize,
+) -> Option<&[HuffmanCode]> {
+  let start = *group.htrees.slice().get(index)? as usize;
+  // `wrapping_add`: an out-of-range `start` (trees past `num_htrees` are
+  // marked `u32::MAX`) gives an empty range rather than an overflow.
+  group.codes.slice().get(start..start.wrapping_add(len))
+}
+
 // The tree with the given index in a Huffman tree group, as
 // HuffmanTreeGroup::build_hgroup_cache lists them; empty if there is none.
 #[inline(always)]
@@ -3380,9 +3422,17 @@ fn huffman_tree<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocator<Huffm
   match group.htrees.slice().get(index) {
     Some(offset) => match group.codes.slice().get(*offset as usize..) {
       Some(slice) if slice.len() >= kHuffmanRootTableSize => slice,
-      _ => &EMPTY_LITERAL_TREE[..],
+      _ => {
+        debug_assert!(!tree_entries_guaranteed(group, index, kHuffmanRootTableSize),
+                       "Huffman tree {} is missing", index);
+        &EMPTY_LITERAL_TREE[..]
+      }
     },
-    None => &EMPTY_LITERAL_TREE[..],
+    None => {
+      debug_assert!(!tree_entries_guaranteed(group, index, kHuffmanRootTableSize),
+                       "Huffman tree {} is missing", index);
+      &EMPTY_LITERAL_TREE[..]
+    }
   }
 }
 
@@ -3392,15 +3442,13 @@ fn distance_root_table<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocato
   index: usize,
 ) -> &HuffmanRootTable {
   use core::convert::TryInto;
-  match group.htrees.slice().get(index) {
-    Some(&offset) => {
-      let start = offset as usize;
-      match group.codes.slice().get(start..start + kHuffmanRootTableSize) {
-        Some(slice) => slice.try_into().unwrap_or(&EMPTY_HUFFMAN_ROOT),
-        None => &EMPTY_HUFFMAN_ROOT,
-      }
+  match tree_entries(group, index, kHuffmanRootTableSize).and_then(|t| t.try_into().ok()) {
+    Some(table) => table,
+    None => {
+      debug_assert!(!tree_entries_guaranteed(group, index, kHuffmanRootTableSize),
+                    "distance tree {} is missing", index);
+      &EMPTY_HUFFMAN_ROOT
     }
-    None => &EMPTY_HUFFMAN_ROOT,
   }
 }
 
@@ -3410,15 +3458,13 @@ fn literal_huffman_tree<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocat
   index: usize,
 ) -> &LiteralTree {
   use core::convert::TryInto;
-  match group.htrees.slice().get(index) {
-    Some(&offset) => {
-      let start = offset as usize;
-      match group.codes.slice().get(start..start + kLiteralMaxTableSize) {
-        Some(slice) => slice.try_into().unwrap_or(&EMPTY_LITERAL_TREE),
-        None => &EMPTY_LITERAL_TREE,
-      }
+  match tree_entries(group, index, kLiteralMaxTableSize).and_then(|t| t.try_into().ok()) {
+    Some(tree) => tree,
+    None => {
+      debug_assert!(!tree_entries_guaranteed(group, index, kLiteralMaxTableSize),
+                    "literal tree {} is missing", index);
+      &EMPTY_LITERAL_TREE
     }
-    None => &EMPTY_LITERAL_TREE,
   }
 }
 
@@ -3428,15 +3474,13 @@ fn command_huffman_tree<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocat
   index: usize,
 ) -> &CommandTree {
   use core::convert::TryInto;
-  match group.htrees.slice().get(index) {
-    Some(&offset) => {
-      let start = offset as usize;
-      match group.codes.slice().get(start..start + kCommandMaxTableSize) {
-        Some(slice) => slice.try_into().unwrap_or(&EMPTY_COMMAND_TREE),
-        None => &EMPTY_COMMAND_TREE,
-      }
+  match tree_entries(group, index, kCommandMaxTableSize).and_then(|t| t.try_into().ok()) {
+    Some(tree) => tree,
+    None => {
+      debug_assert!(!tree_entries_guaranteed(group, index, kCommandMaxTableSize),
+                    "command tree {} is missing", index);
+      &EMPTY_COMMAND_TREE
     }
-    None => &EMPTY_COMMAND_TREE,
   }
 }
 
@@ -3449,27 +3493,15 @@ fn fill_context_trees<'a, AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Alloc
   context_map: &[u8],
   slice_index: usize,
 ) {
-  use core::convert::TryInto;
   let (ref mut filled, ref mut idx) =
     trees.get_or_insert_with(|| ([&EMPTY_LITERAL_TREE; 64], slice_index));
   *idx = slice_index;
-  let htrees = group.htrees.slice();
-  let codes = group.codes.slice();
   if let Some(map) = context_map.get(slice_index..).and_then(|map| map.get(..64)) {
     for (tree, index) in filled.iter_mut().zip(map.iter()) {
-      *tree = match htrees
-        .get(*index as usize)
-        .and_then(|&off| {
-          let start = off as usize;
-          codes.get(start..start + kLiteralMaxTableSize)
-        })
-        .and_then(|s| s.try_into().ok())
-      {
-        Some(t) => t,
-        None => &EMPTY_LITERAL_TREE,
-      };
+      *tree = literal_huffman_tree(group, *index as usize);
     }
   } else {
+    debug_assert!(false, "context map has no 64 entries at {}", slice_index);
     *filled = [&EMPTY_LITERAL_TREE; 64];
   }
 }
@@ -3646,6 +3678,15 @@ fn ProcessCommandsInternal<AllocU8: alloc::Allocator<u8>,
                   }
                   fast_mut!((s.ringbuffer.slice_mut())[pos as usize]) = literal as u8;
                 }
+                // Upstream's guard (dropbox/rust-brotli-decompressor 8164c58):
+                // unreachable, as a block switch always yields a length >= 1,
+                // but it keeps a corrupt state from wrapping the counter.
+                if fast!((s.block_type_length_state.block_length)[0]) == 0 {
+                  mark_unlikely();
+                  result = BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS;
+                  inner_return = true;
+                  break;
+                }
                 fast_mut!((s.block_type_length_state.block_length)[0]) -= 1;
                 BROTLI_LOG_UINT!(s.literal_htree_index);
                 BROTLI_LOG_ARRAY_INDEX!(s.ringbuffer.slice(), pos);
@@ -3782,6 +3823,15 @@ fn ProcessCommandsInternal<AllocU8: alloc::Allocator<u8>,
                   p1 = literal as u8;
                 }
                 fast_slice_mut!((s.ringbuffer)[pos as usize]) = p1;
+                // Upstream's guard (dropbox/rust-brotli-decompressor 8164c58):
+                // unreachable, as a block switch always yields a length >= 1,
+                // but it keeps a corrupt state from wrapping the counter.
+                if fast!((s.block_type_length_state.block_length)[0]) == 0 {
+                  mark_unlikely();
+                  result = BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS;
+                  inner_return = true;
+                  break;
+                }
                 fast_mut!((s.block_type_length_state.block_length)[0]) -= 1;
                 BROTLI_LOG_UINT!(s.context_map.slice()[s.context_map_slice_index as usize +
                                                        context as usize]);
@@ -4122,6 +4172,12 @@ fn ProcessCommandsInternal<AllocU8: alloc::Allocator<u8>,
   s.pos = pos;
   s.loop_counter = i;
 
+  // The groups put in their place above are empty and nothing in the loop
+  // allocates into them, so forgetting them leaks nothing and skips their drop
+  // checks.
+  for group in [&s.literal_hgroup, &s.distance_hgroup, &s.insert_copy_hgroup].iter() {
+    debug_assert!(group.htrees.slice().is_empty() && group.codes.slice().is_empty());
+  }
   core::mem::forget(core::mem::replace(&mut s.literal_hgroup, saved_literal_hgroup));
   core::mem::forget(core::mem::replace(&mut s.distance_hgroup, saved_distance_hgroup));
   core::mem::forget(core::mem::replace(&mut s.insert_copy_hgroup, saved_insert_copy_hgroup));
@@ -5336,6 +5392,10 @@ mod metadata_block_tests {
     }
   }
 
+  // Bytes the bit reader's accumulator holds: 8 on 64-bit targets, 4 on
+  // 32-bit ones.
+  const ACCUMULATOR_BYTES: u32 = ::core::mem::size_of::<bit_reader::reg_t>() as u32;
+
   fn input() -> Vec<u8> {
     (0..64u32).map(|i| (i * 37 + 11) as u8).collect()
   }
@@ -5381,7 +5441,7 @@ mod metadata_block_tests {
   #[test]
   fn zero_length_block_touches_nothing() {
     let input = input();
-    for buffered in 0..9 {
+    for buffered in 0..ACCUMULATOR_BYTES + 1 {
       let mut br = reader(&input, buffered);
       let before = fields(&br);
       let mut remaining = 0;
@@ -5395,7 +5455,7 @@ mod metadata_block_tests {
   #[test]
   fn block_inside_the_accumulator_leaves_the_rest_buffered() {
     let input = input();
-    for buffered in 1..9u32 {
+    for buffered in 1..ACCUMULATOR_BYTES + 1 {
       for len in 1..buffered + 1 {
         let mut br = reader(&input, buffered);
         let mut remaining = len as i32;
@@ -5419,7 +5479,7 @@ mod metadata_block_tests {
   #[test]
   fn longer_block_drains_the_accumulator_then_reads_input_directly() {
     let input = input();
-    for buffered in 0..9u32 {
+    for buffered in 0..ACCUMULATOR_BYTES + 1 {
       for len in buffered + 1..48 {
         let mut br = reader(&input, buffered);
         let mut remaining = len as i32;
@@ -5457,7 +5517,7 @@ mod metadata_block_tests {
   #[test]
   fn block_longer_than_the_input_resumes_on_the_next_call() {
     let input = input();
-    for buffered in 0..9u32 {
+    for buffered in 0..ACCUMULATOR_BYTES + 1 {
       for available in buffered..buffered + 6 {
         let len = available + 5;
         let first = &input[..available as usize];
@@ -5486,7 +5546,7 @@ mod metadata_block_tests {
   #[test]
   fn no_callback_has_the_same_effect_on_the_reader() {
     let input = input();
-    for buffered in 0..9u32 {
+    for buffered in 0..ACCUMULATOR_BYTES + 1 {
       for len in 0..20i32 {
         for &available in [input.len() as u32, buffered + 2].iter() {
           let limited = &input[..available as usize];

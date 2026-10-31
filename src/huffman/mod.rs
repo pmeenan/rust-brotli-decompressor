@@ -26,7 +26,7 @@ pub const BROTLI_HUFFMAN_MAX_TABLE_SIZE: u32 = 1080;
 // 4 + 7 + 15 + 31 + 63 second-level entries, as the C decoder computes it.
 // For the largest alphabet (704 insert-and-copy codes) it equals
 // BROTLI_HUFFMAN_MAX_TABLE_SIZE.
-pub fn BrotliHuffmanMaxTableSize(alphabet_size_limit: u16) -> usize {
+pub const fn BrotliHuffmanMaxTableSize(alphabet_size_limit: u16) -> usize {
   alphabet_size_limit as usize + 376
 }
 pub const BROTLI_HUFFMAN_MAX_CODE_LENGTH_CODE_LENGTH: u32 = 5;
