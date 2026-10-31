@@ -199,3 +199,95 @@ fn truncated_safe_reads_resume_without_losing_bits() {
     }
   }
 }
+
+#[test]
+fn fast_bit_reader_matches_standard_reader_and_reference_bits() {
+  let mut storage = [0u8; 256];
+  for &seed in &[0, 1, 0x89abcdef, 0xffffffff] {
+    pattern(&mut storage, seed);
+    for alignment in 0..8 {
+      let input = &storage[alignment..];
+      for position in 0..(REG_BYTES as u32 * 8) {
+        for count in 0..25 {
+          let mut std_reader = BrotliBitReader {
+            val_: reference_word(&input[..REG_BYTES]) as reg_t,
+            bit_pos_: position,
+            next_in: REG_BYTES as u32,
+            avail_in: (input.len() - REG_BYTES) as u32,
+          };
+          let mut fast_backing = BrotliBitReader { ..std_reader };
+          let mut fast_reader = BrotliFastBitReader::new(&fast_backing, input);
+
+          let expected = reference_bits(input, position as usize, count);
+          let std_val = BrotliReadBits(&mut std_reader, count, input);
+          let fast_val = fast_reader.read_bits(count);
+          assert_eq!(fast_val, expected);
+          assert_eq!(fast_val, std_val);
+          assert_eq!(fast_reader.avail_in(), std_reader.avail_in);
+
+          fast_reader.store(&mut fast_backing);
+          assert_eq!(fast_backing.val_, std_reader.val_);
+          assert_eq!(fast_backing.bit_pos_, std_reader.bit_pos_);
+          assert_eq!(fast_backing.next_in, std_reader.next_in);
+          assert_eq!(fast_backing.avail_in, std_reader.avail_in);
+        }
+      }
+
+      // Multi-step sequence mixing `get_16_bits_unmasked`, `get_bits`,
+      // `drop_bits`, `read_bits`, and periodic `store` / reload.
+      let mut std_reader = BrotliBitReader {
+        val_: reference_word(&input[..REG_BYTES]) as reg_t,
+        bit_pos_: 0,
+        next_in: REG_BYTES as u32,
+        avail_in: (input.len() - REG_BYTES) as u32,
+      };
+      let mut fast_backing = BrotliBitReader { ..std_reader };
+      let mut fast_reader = BrotliFastBitReader::new(&fast_backing, input);
+      let mut position = 0usize;
+      let mut step = 0usize;
+      while fast_reader.avail_in() >= 16 {
+        let count = ((step * 13 + alignment) % 25) as u32;
+        let expected = reference_bits(input, position, count);
+        match step % 3 {
+          0 => {
+            let std_peek = BrotliGet16BitsUnmasked(&mut std_reader, input);
+            let fast_peek = fast_reader.get_16_bits_unmasked();
+            assert_eq!(fast_peek, std_peek);
+            let width = count.min(16);
+            assert_eq!(fast_peek & BitMask(width), reference_bits(input, position, width));
+            BrotliDropBits(&mut std_reader, width);
+            fast_reader.drop_bits(width);
+            position += width as usize;
+          }
+          1 => {
+            let width = count.min(MAX_PEEK_BITS);
+            let std_val = BrotliGetBits(&mut std_reader, width, input);
+            let fast_val = fast_reader.get_bits(width);
+            assert_eq!(fast_val, std_val);
+            assert_eq!(fast_val, reference_bits(input, position, width));
+            BrotliDropBits(&mut std_reader, width);
+            fast_reader.drop_bits(width);
+            position += width as usize;
+          }
+          _ => {
+            let std_val = BrotliReadBits(&mut std_reader, count, input);
+            let fast_val = fast_reader.read_bits(count);
+            assert_eq!(fast_val, std_val);
+            assert_eq!(fast_val, expected);
+            position += count as usize;
+          }
+        }
+        assert_eq!(fast_reader.avail_in(), std_reader.avail_in);
+        if step % 4 == 0 {
+          fast_reader.store(&mut fast_backing);
+          assert_eq!(fast_backing.val_, std_reader.val_);
+          assert_eq!(fast_backing.bit_pos_, std_reader.bit_pos_);
+          assert_eq!(fast_backing.next_in, std_reader.next_in);
+          assert_eq!(fast_backing.avail_in, std_reader.avail_in);
+          fast_reader = BrotliFastBitReader::new(&fast_backing, input);
+        }
+        step += 1;
+      }
+    }
+  }
+}

@@ -174,6 +174,7 @@ fn BrotliLoad64LE(input: &[u8], next_in_u32: u32) -> u64 {
 #[allow(dead_code)]
 pub const BROTLI_ALIGNED_READ: u8 = 0;
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) {
   BrotliFillBitWindowCompileTimeNbits(br, n_bits, input);
@@ -257,6 +258,7 @@ pub fn BrotliGet16BitsUnmasked(br: &mut BrotliBitReader, input: &[u8]) -> u32 {
 }
 
 // Returns the specified number of bits from br without advancing bit pos.
+#[allow(dead_code)]
 #[inline(always)]
 pub fn BrotliGetBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u32 {
   BrotliFillBitWindow(br, n_bits, input);
@@ -488,6 +490,159 @@ pub fn BrotliWarmupBitReader(br: &mut BrotliBitReader, input: &[u8]) -> bool {
 }
 
 
+// A short-lived copy of a `BrotliBitReader` for the decoder's hot loops.
+//
+// The unread input is held as a subslice `tail` of the input, so the slice
+// length is the number of bytes left (`avail_in`) and a refill is one length
+// check, one load and one pointer bump, like the C decoder's `next_in`
+// pointer. `BrotliBitReader` instead keeps `next_in` and `avail_in`, so every
+// refill bounds-checks `next_in` against `input.len()` and also updates
+// `avail_in`; on 32-bit targets, which refill every 16 bits, that is a large
+// part of the cost of a command. Bits are consumed exactly as by the
+// `BrotliBitReader` functions with the same `n_bits`. Callers must have
+// checked that enough input is available (as the non-safe decoding paths
+// do); if not, missing bytes read as zero instead of panicking.
+pub struct BrotliFastBitReader<'a> {
+  pub val_: reg_t,
+  pub bit_pos_: u32,
+  tail: &'a [u8],
+  start_len: usize,
+}
+
+impl<'a> BrotliFastBitReader<'a> {
+  #[inline(always)]
+  pub fn new(br: &BrotliBitReader, input: &'a [u8]) -> Self {
+    let start = br.next_in as usize;
+    let tail = match input.get(start..) {
+      Some(rest) => rest.get(..br.avail_in as usize).unwrap_or(rest),
+      None => &[],
+    };
+    BrotliFastBitReader {
+      val_: br.val_,
+      bit_pos_: br.bit_pos_,
+      tail: tail,
+      start_len: tail.len(),
+    }
+  }
+
+  // Writes the state back to `br`, which must be the reader it was created
+  // from.
+  #[inline(always)]
+  pub fn store(&self, br: &mut BrotliBitReader) {
+    let consumed = (self.start_len - self.tail.len()) as u32;
+    br.val_ = self.val_;
+    br.bit_pos_ = self.bit_pos_;
+    br.next_in = br.next_in.wrapping_add(consumed);
+    br.avail_in = br.avail_in.wrapping_sub(consumed);
+  }
+
+  // Bytes of input not yet loaded into the register; the same as
+  // `BrotliBitReader::avail_in`.
+  #[inline(always)]
+  pub fn avail_in(&self) -> u32 {
+    self.tail.len() as u32
+  }
+
+  // Same as `BrotliFillBitWindowCompileTimeNbits`.
+  #[inline(always)]
+  pub fn fill(&mut self, n_bits: u32) {
+    #[cfg(target_pointer_width = "64")]
+    {
+      if n_bits <= 8 {
+        if self.bit_pos_ >= 56 {
+          self.val_ >>= 56;
+          self.bit_pos_ ^= 56;
+          if let &[a, b, c, d, e, f, g, h, ..] = self.tail {
+            self.tail = &self.tail[7..];
+            self.val_ |= u64::from_le_bytes([a, b, c, d, e, f, g, h]) << 8;
+          }
+        }
+      } else if n_bits <= 16 {
+        if self.bit_pos_ >= 48 {
+          self.val_ >>= 48;
+          self.bit_pos_ ^= 48;
+          if let &[a, b, c, d, e, f, g, h, ..] = self.tail {
+            self.tail = &self.tail[6..];
+            self.val_ |= u64::from_le_bytes([a, b, c, d, e, f, g, h]) << 16;
+          }
+        }
+      } else if self.bit_pos_ >= 32 {
+        self.val_ >>= 32;
+        self.bit_pos_ ^= 32;
+        if let &[a, b, c, d, ref rest @ ..] = self.tail {
+          self.tail = rest;
+          self.val_ |= (u32::from_le_bytes([a, b, c, d]) as reg_t) << 32;
+        }
+      }
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+      let _ = n_bits;
+      if self.bit_pos_ >= 16 {
+        self.val_ >>= 16;
+        self.bit_pos_ &= 15;
+        if let &[a, b, ref rest @ ..] = self.tail {
+          self.tail = rest;
+          self.val_ |= (u16::from_le_bytes([a, b]) as reg_t) << 16;
+        }
+      }
+    }
+  }
+
+  #[inline(always)]
+  pub fn get_bits_unmasked(&self) -> reg_t {
+    self.val_ >> self.bit_pos_
+  }
+
+  // Same as `BrotliGet16BitsUnmasked`.
+  #[inline(always)]
+  pub fn get_16_bits_unmasked(&mut self) -> u32 {
+    self.fill(16);
+    (self.get_bits_unmasked() & (0xffffffffu32 as reg_t)) as u32
+  }
+
+  // Same as `BrotliGetBits`.
+  #[inline(always)]
+  pub fn get_bits(&mut self, n_bits: u32) -> u32 {
+    self.fill(n_bits);
+    (self.get_bits_unmasked() as u32) & BitMask(n_bits)
+  }
+
+  #[inline(always)]
+  pub fn drop_bits(&mut self, n_bits: u32) {
+    self.bit_pos_ += n_bits;
+  }
+
+  #[inline(always)]
+  fn take_bits(&mut self, n_bits: u32) -> u32 {
+    let val = (self.get_bits_unmasked() as u32) & BitMask(n_bits);
+    self.drop_bits(n_bits);
+    val
+  }
+
+  // Same as `BrotliReadBits`.
+  #[inline(always)]
+  pub fn read_bits(&mut self, n_bits: u32) -> u32 {
+    if ::core::mem::size_of::<reg_t>() == 8 {
+      self.fill(32);
+      self.take_bits(n_bits)
+    } else {
+      self.fill(16);
+      if n_bits <= 16 {
+        self.take_bits(n_bits)
+      } else {
+        let low_val = self.get_bits_unmasked() as u16 as u32;
+        self.val_ >>= 16;
+        if let &[a, b, ref rest @ ..] = self.tail {
+          self.tail = rest;
+          self.val_ |= (u16::from_le_bytes([a, b]) as reg_t) << 16;
+        }
+        let high_val = self.take_bits(n_bits - 16);
+        low_val | (high_val << 16)
+      }
+    }
+  }
+}
 
 #[cfg(test)]
 mod tests {
