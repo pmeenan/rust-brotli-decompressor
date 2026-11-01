@@ -270,22 +270,15 @@ fn ReplicateValue(table: &mut [HuffmanCode],
   } {
     return false;
   }
-  let start = offset as usize;
-  let last = match start.checked_add(end_u - step_u) {
-    Some(last) => last,
-    None => return false,
-  };
-  let slice = match table.get_mut(start..=last) {
+  let span = end_u - step_u;
+  let slice = match table.get_mut(offset as usize..).and_then(|s| s.get_mut(..=span)) {
     Some(s) => s,
     None => return false,
   };
-  let mut pos = end_u - step_u;
-  loop {
-    slice[pos] = code;
-    if pos < step_u {
-      break;
-    }
-    pos -= step_u;
+  let mut pos = 0;
+  while let Some(slot) = slice.get_mut(pos) {
+    *slot = code;
+    pos += step_u;
   }
   true
 }
@@ -299,12 +292,13 @@ fn ReplicateValue(table: &mut [HuffmanCode],
 #[inline(always)]
 fn NextTableBitSize(count: &[u16], mut len: i32, root_bits: i32) -> Option<i32> {
   debug_assert!(len > root_bits);
-  let mut left: i64 = 1i64 << (len - root_bits);
+  let mut left: i32 = 1i32 << (len - root_bits);
   while len < BROTLI_HUFFMAN_MAX_CODE_LENGTH as i32 {
-    if len as usize >= count.len() {
-      return None;
-    }
-    left -= i64::from(fast!((count)[len as usize]));
+    let c = match count.get(len as usize) {
+      Some(&c) => c,
+      None => return None,
+    };
+    left -= i32::from(c);
     if left <= 0 {
       break;
     }

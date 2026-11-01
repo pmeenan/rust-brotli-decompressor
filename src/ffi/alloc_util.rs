@@ -78,6 +78,7 @@ impl<Ty:Sized+Default> core::ops::IndexMut<usize> for MemoryBlock<Ty> {
 // None lets callers report BROTLI_DECODER_ERROR_ALLOC_* exactly as they do
 // when a C allocator returns null.
 #[cfg(feature = "std")]
+#[inline(never)]
 fn try_alloc_default_slice<Ty: Sized + Default + Clone>(size: usize) -> Option<Box<[Ty]>> {
     let mut elements = if size == 0 || core::mem::size_of::<Ty>() == 0 {
         // Nothing to allocate: this Vec never touches the allocator.

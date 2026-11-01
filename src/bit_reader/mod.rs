@@ -142,9 +142,14 @@ pub fn BrotliCheckInputAmount(br: &BrotliBitReader, num: u32) -> bool {
 // Callers refill only when the caller checked enough input is available, so
 // the zero fallback is unreachable; it replaces a panicking index.
 fn BrotliLoad16LE(input: &[u8], next_in_u32: u32) -> u16 {
-  match input.get(next_in_u32 as usize..) {
-    Some(&[a, b, ..]) => u16::from_le_bytes([a, b]),
-    _ => {
+  use core::convert::TryInto;
+  match input
+    .get(next_in_u32 as usize..)
+    .and_then(|rest| rest.get(..2))
+    .and_then(|bytes| bytes.try_into().ok())
+  {
+    Some(bytes) => u16::from_le_bytes(bytes),
+    None => {
       debug_assert!(false, "BrotliLoad16LE past the end of the input");
       0
     }
@@ -546,32 +551,33 @@ impl<'a> BrotliFastBitReader<'a> {
   // Same as `BrotliFillBitWindowCompileTimeNbits`.
   #[inline(always)]
   pub fn fill(&mut self, n_bits: u32) {
+    use core::convert::TryInto;
     #[cfg(target_pointer_width = "64")]
     {
       if n_bits <= 8 {
         if self.bit_pos_ >= 56 {
           self.val_ >>= 56;
           self.bit_pos_ ^= 56;
-          if let &[a, b, c, d, e, f, g, h, ..] = self.tail {
+          if let Some(bytes) = self.tail.get(..8).and_then(|s| s.try_into().ok()) {
             self.tail = &self.tail[7..];
-            self.val_ |= u64::from_le_bytes([a, b, c, d, e, f, g, h]) << 8;
+            self.val_ |= u64::from_le_bytes(bytes) << 8;
           }
         }
       } else if n_bits <= 16 {
         if self.bit_pos_ >= 48 {
           self.val_ >>= 48;
           self.bit_pos_ ^= 48;
-          if let &[a, b, c, d, e, f, g, h, ..] = self.tail {
+          if let Some(bytes) = self.tail.get(..8).and_then(|s| s.try_into().ok()) {
             self.tail = &self.tail[6..];
-            self.val_ |= u64::from_le_bytes([a, b, c, d, e, f, g, h]) << 16;
+            self.val_ |= u64::from_le_bytes(bytes) << 16;
           }
         }
       } else if self.bit_pos_ >= 32 {
         self.val_ >>= 32;
         self.bit_pos_ ^= 32;
-        if let &[a, b, c, d, ref rest @ ..] = self.tail {
-          self.tail = rest;
-          self.val_ |= (u32::from_le_bytes([a, b, c, d]) as reg_t) << 32;
+        if let Some(bytes) = self.tail.get(..4).and_then(|s| s.try_into().ok()) {
+          self.tail = &self.tail[4..];
+          self.val_ |= (u32::from_le_bytes(bytes) as reg_t) << 32;
         }
       }
     }
@@ -581,9 +587,9 @@ impl<'a> BrotliFastBitReader<'a> {
       if self.bit_pos_ >= 16 {
         self.val_ >>= 16;
         self.bit_pos_ &= 15;
-        if let &[a, b, ref rest @ ..] = self.tail {
-          self.tail = rest;
-          self.val_ |= (u16::from_le_bytes([a, b]) as reg_t) << 16;
+        if let Some(bytes) = self.tail.get(..2).and_then(|s| s.try_into().ok()) {
+          self.tail = &self.tail[2..];
+          self.val_ |= (u16::from_le_bytes(bytes) as reg_t) << 16;
         }
       }
     }
@@ -631,11 +637,12 @@ impl<'a> BrotliFastBitReader<'a> {
       if n_bits <= 16 {
         self.take_bits(n_bits)
       } else {
+        use core::convert::TryInto;
         let low_val = self.get_bits_unmasked() as u16 as u32;
         self.val_ >>= 16;
-        if let &[a, b, ref rest @ ..] = self.tail {
-          self.tail = rest;
-          self.val_ |= (u16::from_le_bytes([a, b]) as reg_t) << 16;
+        if let Some(bytes) = self.tail.get(..2).and_then(|s| s.try_into().ok()) {
+          self.tail = &self.tail[2..];
+          self.val_ |= (u16::from_le_bytes(bytes) as reg_t) << 16;
         }
         let high_val = self.take_bits(n_bits - 16);
         low_val | (high_val << 16)
