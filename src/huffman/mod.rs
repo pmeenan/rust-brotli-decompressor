@@ -299,7 +299,8 @@ fn replicate_value_pow2(table: &mut [HuffmanCode],
                         step: usize,
                         end: usize,
                         code: HuffmanCode) -> bool {
-  let last = end - step;
+  debug_assert!(step > 0 && end >= step && (end % step) == 0);
+  let last = end.wrapping_sub(step);
   let slice = match table.get_mut(offset..) {
     Some(s) => match s.get_mut(..=last) {
       Some(s) => s,
