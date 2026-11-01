@@ -40,12 +40,18 @@ pub const BROTLI_HUFFMAN_MAX_SIZE_258: u32 = 632;
 pub const BROTLI_HUFFMAN_MAX_SIZE_272: u32 = 646;
 
 // 4-byte aligned so that a copy, and the fill of a new table, is one 32-bit
-// access rather than separate 16- and 8-bit ones.
+// access rather than separate 16- and 8-bit ones. On 32-bit targets `bits` is
+// placed in the low byte and `value` in the upper 16 bits (matching C's
+// `BROTLI_HUFFMAN_CODE_FAST_LOAD`) so a 32-bit load extracts `bits` via
+// `uxtb`/`uxtab` and `value` via `lsr #16`.
 #[repr(C, align(4))]
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub struct HuffmanCode {
+  #[cfg(target_pointer_width = "64")]
   pub value: u16, // symbol value or table offset
   pub bits: u8, // number of bits used for this symbol
+  #[cfg(not(target_pointer_width = "64"))]
+  pub value: u16, // symbol value or table offset
 }
 
 impl HuffmanCode {

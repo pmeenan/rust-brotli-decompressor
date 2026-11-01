@@ -374,6 +374,18 @@ fn DecodeMetaBlockLength<AllocU8: alloc::Allocator<u8>,
     }
   }
 }
+// Outlined from `load_huffman_code` (no `#[inline]`) so rustc's MIR inliner
+// leaves `dst` as a pointer parameter until LLVM's CGSCC pass inlines
+// `copy_from_slice_impl` and folds the 4-byte `memcpy` into a single 32-bit
+// `load i32` + `store i32` before SROA sees the caller's stack slot.
+#[cfg(not(target_pointer_width = "64"))]
+fn load_huffman_code_into(dst: &mut [HuffmanCode; 1], table: &[HuffmanCode], idx: usize) {
+  match table.get(idx..idx + 1) {
+    Some(sub) => dst.clone_from_slice(sub),
+    None => debug_assert!(false, "Huffman table index {} out of range", idx),
+  }
+}
+
 #[inline(always)]
 fn load_huffman_code(table: &[HuffmanCode], idx: usize) -> HuffmanCode {
   #[cfg(target_pointer_width = "64")]
@@ -384,13 +396,9 @@ fn load_huffman_code(table: &[HuffmanCode], idx: usize) -> HuffmanCode {
   {
     // Table builders fill every entry a valid code can reach, so the fallback
     // is unreachable; it avoids a panic path in the hot loop.
-    match table.get(idx) {
-      Some(&e) => e,
-      None => {
-        debug_assert!(false, "Huffman table index {} out of range", idx);
-        HuffmanCode { value: 0, bits: 0 }
-      }
-    }
+    let mut slot = [HuffmanCode { value: 0, bits: 0 }];
+    load_huffman_code_into(&mut slot, table, idx);
+    slot[0]
   }
 }
 
@@ -487,15 +495,16 @@ fn SafeDecodeSymbol(table: &[HuffmanCode],
                     -> bool {
   let mut available_bits = bit_reader::BrotliGetAvailableBits(br);
   if (available_bits == 0) {
-    if (fast!((table)[0]).bits == 0) {
-      *result = fast!((table)[0]).value as u32;
+    let root0 = load_huffman_code(table, 0);
+    if (root0.bits == 0) {
+      *result = root0.value as u32;
       return true;
     }
     return false; /* No valid bits at all. */
   }
   let mut val = bit_reader::BrotliGetBitsUnmasked(br) as u32;
   let table_index = (val & HUFFMAN_TABLE_MASK) as usize;
-  let table_element = fast!((table)[table_index]);
+  let table_element = load_huffman_code(table, table_index);
   if (table_element.bits <= HUFFMAN_TABLE_BITS as u8) {
     if (table_element.bits as u32 <= available_bits) {
       bit_reader::BrotliDropBits(&mut br, table_element.bits as u32);
@@ -512,7 +521,8 @@ fn SafeDecodeSymbol(table: &[HuffmanCode],
   // Speculatively drop HUFFMAN_TABLE_BITS.
   val = (val & bit_reader::BitMask(table_element.bits as u32)) >> HUFFMAN_TABLE_BITS;
   available_bits -= HUFFMAN_TABLE_BITS;
-  let table_sub_element = fast!((table)[table_index + table_element.value as usize + val as usize]);
+  let table_sub_element =
+    load_huffman_code(table, table_index + table_element.value as usize + val as usize);
   if (available_bits < table_sub_element.bits as u32) {
     return false; /* Not enough bits for the second level. */
   }
@@ -733,7 +743,10 @@ fn ReadSymbolCodeLengths<AllocU8: alloc::Allocator<u8>,
       bit_reader::BrotliGetBitsUnmasked(&s.br) &
       bit_reader::BitMask(huffman::BROTLI_HUFFMAN_MAX_CODE_LENGTH_CODE_LENGTH as u32)
         as bit_reader::reg_t;
+    #[cfg(target_pointer_width = "64")]
     let p = fast!((s.table)[p_index as usize]);
+    #[cfg(not(target_pointer_width = "64"))]
+    let p = load_huffman_code(&s.table, p_index as usize);
     bit_reader::BrotliDropBits(&mut s.br, p.bits as u32); /* Use 1..5 bits */
     code_len = p.value as u32; /* code_len == 0..17 */
     if (code_len < kCodeLengthRepeatCode) {
@@ -791,7 +804,10 @@ fn SafeReadSymbolCodeLengths<AllocU8: alloc::Allocator<u8>,
     }
     p_index += bits &
                bit_reader::BitMask(huffman::BROTLI_HUFFMAN_MAX_CODE_LENGTH_CODE_LENGTH as u32);
+    #[cfg(target_pointer_width = "64")]
     let p = fast!((s.table)[p_index as usize]);
+    #[cfg(not(target_pointer_width = "64"))]
+    let p = load_huffman_code(&s.table, p_index as usize);
     if (p.bits as u32 > available_bits) {
       // pullMoreInput;
       if (!bit_reader::BrotliPullByte(&mut s.br, input)) {
@@ -3033,7 +3049,10 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
     // `br` stands in for `s.br`; see `ProcessCommandsInternal`.
     let bits = br.get_16_bits_unmasked();
     let mut table_index = bits & HUFFMAN_TABLE_MASK;
+    #[cfg(target_pointer_width = "64")]
     let mut table_element = distance_root[table_index as usize];
+    #[cfg(not(target_pointer_width = "64"))]
+    let mut table_element = load_huffman_code(distance_root, table_index as usize);
     if table_element.bits > HUFFMAN_TABLE_BITS as u8 {
       mark_unlikely();
       let nbits = table_element.bits - HUFFMAN_TABLE_BITS as u8;

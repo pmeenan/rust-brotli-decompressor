@@ -42,8 +42,13 @@ typedef struct HuffmanCodeStruct {
 #else
 #error "HuffmanCode requires compiler support for 4-byte alignment"
 #endif
+#if defined(__LP64__) || defined(_WIN64) || (defined(UINTPTR_MAX) && UINTPTR_MAX > 0xffffffffU)
     uint16_t value;
     uint8_t bits;
+#else
+    uint8_t bits;
+    uint16_t value;
+#endif
 } HuffmanCode;
 
 
