@@ -258,10 +258,12 @@ fn BrotliReverseBits(num: u8) -> u32 {
 // `table[offset + end - step]`.
 // Assumes that `end` is a positive integer multiple of `step`.
 //
-// `step` is always a power of two (`1 << bits`) in valid callers; testing the
-// power-of-two case with a bitmask avoids emitting a division instruction on
-// 32-bit targets. Slicing `table[offset ..= offset + end - step]` up front
-// bounds-checks the whole written extent once before the loop.
+// `BrotliBuildCodeLengthsHuffmanTable` and `BrotliBuildHuffmanTable` always
+// pass `step = 1 << bits` and `end = 1 << table_bits` with `1 <= bits <= table_bits`,
+// so they call `replicate_value_pow2` directly to avoid per-symbol sign and
+// divisibility checks. `ReplicateValue` retains the full input validation for
+// white-box guard tests.
+#[cfg(test)]
 #[inline(always)]
 fn ReplicateValue(table: &mut [HuffmanCode],
                   offset: u32,
@@ -280,15 +282,35 @@ fn ReplicateValue(table: &mut [HuffmanCode],
   } {
     return false;
   }
-  let span = end_u - step_u;
-  let slice = match table.get_mut(offset as usize..).and_then(|s| s.get_mut(..=span)) {
-    Some(s) => s,
+  replicate_value_pow2(table, offset as usize, step_u, end_u, code)
+}
+
+// Do not mark `#[inline]` or `#[inline(always)]`: if rustc's MIR inliner
+// inlines this before LLVM IR lowering, `*slot = HuffmanCode::new(...)` is
+// lowered as three separate field stores (`bits`, `pad`, `value`). Leaving
+// inlining to LLVM's CGSCC pass coerces the 4-byte `#[repr(C, align(4))]`
+// `HuffmanCode` argument to `i32` on 32-bit targets and emits a single 32-bit
+// `str.w` per table slot.
+// Two-step slicing (`get_mut(offset..)` then `get_mut(..=last)`) uses
+// `RangeToInclusive` so the length `last + 1` is known non-zero and avoids
+// `RangeInclusive`'s extra overflow/empty-slice checks.
+fn replicate_value_pow2(table: &mut [HuffmanCode],
+                        offset: usize,
+                        step: usize,
+                        end: usize,
+                        code: HuffmanCode) -> bool {
+  let last = end - step;
+  let slice = match table.get_mut(offset..) {
+    Some(s) => match s.get_mut(..=last) {
+      Some(s) => s,
+      None => return false,
+    },
     None => return false,
   };
   let mut pos = 0;
   while let Some(slot) = slice.get_mut(pos) {
     *slot = code;
-    pos += step_u;
+    pos += step;
   }
   true
 }
@@ -356,7 +378,13 @@ pub fn BrotliBuildCodeLengthsHuffmanTable(mut table: &mut [HuffmanCode],
     }
     actual_count[code_length_index] += 1;
   }
-  if actual_count[1..] != count[1..actual_count.len()] {
+  // Avoid a `slice != slice` comparison, which lowers to a `bcmp` call for the
+  // 5-element (10-byte) histogram check on every Huffman table build.
+  let mut count_diff = 0u16;
+  for (a, c) in actual_count[1..].iter().zip(count[1..actual_count.len()].iter()) {
+    count_diff |= *a ^ *c;
+  }
+  if count_diff != 0 {
     return false;
   }
 
@@ -417,10 +445,10 @@ pub fn BrotliBuildCodeLengthsHuffmanTable(mut table: &mut [HuffmanCode],
     while bits_count != 0 {
       code.value = fast!((sorted)[symbol as usize]) as u16;
       symbol += 1;
-      let reversed_key = BrotliReverseBits(key as u8);
-      // Cannot fail while table_size is 32: step is 1 << bits and
-      // reversed_key < 1 << bits, so the last index written is below table_size.
-      if !ReplicateValue(&mut table, reversed_key, step, table_size, code) {
+      let reversed_key = BrotliReverseBits(key as u8) as usize;
+      // Cannot fail while `table_size` is 32: `step` is `1 << bits` and
+      // `reversed_key < 1 << bits`, so the last index written is below `table_size`.
+      if !replicate_value_pow2(&mut table, reversed_key, step as usize, table_size as usize, code) {
         return false;
       }
       key += key_step;
@@ -502,8 +530,13 @@ pub fn BrotliBuildHuffmanTable(mut root_table: &mut [HuffmanCode],
       };
       code.value = symbol as u16;
       let reversed_key = BrotliReverseBits(key as u8);
-      if !ReplicateValue(&mut root_table, table_free_offset + reversed_key, step,
-                         table_size, code) {
+      if !replicate_value_pow2(
+        &mut root_table,
+        (table_free_offset + reversed_key) as usize,
+        step as usize,
+        table_size as usize,
+        code,
+      ) {
         return 0;
       }
       key += key_step;
@@ -574,8 +607,13 @@ pub fn BrotliBuildHuffmanTable(mut root_table: &mut [HuffmanCode],
       };
       code.value = symbol as u16;
       let reversed_sub_key = BrotliReverseBits(sub_key as u8);
-      if !ReplicateValue(&mut root_table, table_free_offset + reversed_sub_key, step,
-                         table_size, code) {
+      if !replicate_value_pow2(
+        &mut root_table,
+        (table_free_offset + reversed_sub_key) as usize,
+        step as usize,
+        table_size as usize,
+        code,
+      ) {
         return 0;
       }
       sub_key += sub_key_step;

@@ -105,6 +105,7 @@ pub fn BrotliBitReaderRestoreState(to: &mut BrotliBitReader, from: &BrotliBitRea
   to.avail_in = from.avail_in;
 }
 
+#[inline(always)]
 pub fn BrotliGetAvailableBits(br: &BrotliBitReader) -> u32 {
   ((::core::mem::size_of::<reg_t>() as u32) << 3) - br.bit_pos_
 }
@@ -239,17 +240,23 @@ fn BrotliFillBitWindowCompileTimeNbits(br: &mut BrotliBitReader, n_bits: u32, in
 
 // Mosltly like BrotliFillBitWindow, but guarantees only 16 bits and reads no
 // more than BROTLI_SHORT_FILL_BIT_WINDOW_READ bytes of input.
+#[allow(dead_code)]
 pub fn BrotliFillBitWindow16(br: &mut BrotliBitReader, input: &[u8]) {
   BrotliFillBitWindowCompileTimeNbits(br, 17, input);
 }
 
 // Pulls one byte of input to accumulator.
+#[inline(always)]
 pub fn BrotliPullByte(br: &mut BrotliBitReader, input: &[u8]) -> bool {
   if br.avail_in == 0 {
     return false;
   }
+  let byte = match input.get(br.next_in as usize) {
+    Some(&b) => b as reg_t,
+    None => return false,
+  };
   br.val_ >>= 8;
-  br.val_ |= (fast!((input)[br.next_in as usize]) as reg_t) << ((::core::mem::size_of::<reg_t>() << 3) - 8);
+  br.val_ |= byte << ((::core::mem::size_of::<reg_t>() << 3) - 8);
   br.bit_pos_ -= 8;
   br.avail_in -= 1;
   br.next_in += 1;
@@ -271,23 +278,30 @@ pub fn BrotliGet16BitsUnmasked(br: &mut BrotliBitReader, input: &[u8]) -> u32 {
   (BrotliGetBitsUnmasked(br) & (0xffffffffu32 as reg_t)) as u32
 }
 
-// Returns the specified number of bits from br without advancing bit pos.
+// Returns the specified number of bits from `br` without advancing bit pos.
+// On 32-bit targets a single refill guarantees at most 16 bits, so `n_bits`
+// must be `<= 16` (`<= 32` on 64-bit targets).
 #[allow(dead_code)]
 #[inline(always)]
 pub fn BrotliGetBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u32 {
+  debug_assert!(::core::mem::size_of::<reg_t>() == 8 || n_bits <= 16);
   BrotliFillBitWindow(br, n_bits, input);
   (BrotliGetBitsUnmasked(br) as u32) & BitMask(n_bits)
 }
 
-// Returns the specified number of bits from br without advancing bit pos.
+// Returns the specified number of bits from `br` without advancing bit pos.
+// On 32-bit targets a single refill guarantees at most 16 bits, so `n_bits`
+// must be `<= 16` (`<= 32` on 64-bit targets).
 #[allow (dead_code)]
 pub fn BrotliGetConstantNBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u32 {
+  debug_assert!(::core::mem::size_of::<reg_t>() == 8 || n_bits <= 16);
   BrotliFillBitWindowCompileTimeNbits(br, n_bits, input);
   (BrotliGetBitsUnmasked(br) as u32) & BitMask(n_bits)
 }
 
 // Tries to peek the specified amount of bits. Returns 0, if there is not
 // enough input.
+#[inline(always)]
 pub fn BrotliSafeGetBits(br: &mut BrotliBitReader,
                          n_bits: u32,
                          val: &mut u32,
@@ -379,7 +393,9 @@ pub fn BrotliReadConstantNBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u
     let mut high_val: u32 = 0;
     BrotliFillBitWindowCompileTimeNbits(br, 16, input);
     BrotliTakeBits(br, 16, &mut low_val);
-    BrotliFillBitWindowCompileTimeNbits(br, 8, input);
+    // Refill 16 bits (not 8) so `n_bits` up to 32 (`n_bits - 16` up to 16) has
+    // enough bits buffered on 32-bit targets.
+    BrotliFillBitWindowCompileTimeNbits(br, 16, input);
     BrotliTakeBits(br, n_bits - 16, &mut high_val);
     low_val | (high_val << 16)
   }
@@ -406,6 +422,7 @@ fn BrotliSafeReadBits32Slow(br: &mut BrotliBitReader,
 
 // Tries to read the specified amount of bits. Returns 0, if there is not
 // enough input. n_bits MUST be positive.
+#[inline(always)]
 pub fn BrotliSafeReadBits(br: &mut BrotliBitReader,
                           n_bits: u32,
                           val: &mut u32,
@@ -516,7 +533,8 @@ pub fn BrotliWarmupBitReader(br: &mut BrotliBitReader, input: &[u8]) -> bool {
 // part of the cost of a command. Bits are consumed exactly as by the
 // `BrotliBitReader` functions with the same `n_bits`. Callers must have
 // checked that enough input is available (as the non-safe decoding paths
-// do); if not, missing bytes read as zero instead of panicking.
+// do); if not, debug builds fail a `debug_assert!` and release builds read
+// missing bytes as zero instead of panicking.
 pub struct BrotliFastBitReader<'a> {
   pub val_: reg_t,
   pub bit_pos_: u32,
@@ -572,6 +590,8 @@ impl<'a> BrotliFastBitReader<'a> {
           if let Some(bytes) = self.tail.get(..8).and_then(|s| s.try_into().ok()) {
             self.tail = &self.tail[7..];
             self.val_ |= u64::from_le_bytes(bytes) << 8;
+          } else {
+            debug_assert!(false, "BrotliFastBitReader::fill past the end of the input");
           }
         }
       } else if n_bits <= 16 {
@@ -581,6 +601,8 @@ impl<'a> BrotliFastBitReader<'a> {
           if let Some(bytes) = self.tail.get(..8).and_then(|s| s.try_into().ok()) {
             self.tail = &self.tail[6..];
             self.val_ |= u64::from_le_bytes(bytes) << 16;
+          } else {
+            debug_assert!(false, "BrotliFastBitReader::fill past the end of the input");
           }
         }
       } else if self.bit_pos_ >= 32 {
@@ -589,6 +611,8 @@ impl<'a> BrotliFastBitReader<'a> {
         if let Some(bytes) = self.tail.get(..4).and_then(|s| s.try_into().ok()) {
           self.tail = &self.tail[4..];
           self.val_ |= (u32::from_le_bytes(bytes) as reg_t) << 32;
+        } else {
+          debug_assert!(false, "BrotliFastBitReader::fill past the end of the input");
         }
       }
     }
@@ -609,6 +633,8 @@ impl<'a> BrotliFastBitReader<'a> {
           if let Some(bytes) = self.tail.get(..4).and_then(|s| s.try_into().ok()) {
             self.tail = &self.tail[3..];
             self.val_ |= (u32::from_le_bytes(bytes) as reg_t) << 8;
+          } else {
+            debug_assert!(false, "BrotliFastBitReader::fill past the end of the input");
           }
         }
       } else if self.bit_pos_ >= 16 {
@@ -617,6 +643,8 @@ impl<'a> BrotliFastBitReader<'a> {
         if let Some(bytes) = self.tail.get(..2).and_then(|s| s.try_into().ok()) {
           self.tail = &self.tail[2..];
           self.val_ |= (u16::from_le_bytes(bytes) as reg_t) << 16;
+        } else {
+          debug_assert!(false, "BrotliFastBitReader::fill past the end of the input");
         }
       }
     }
@@ -671,6 +699,8 @@ impl<'a> BrotliFastBitReader<'a> {
         if let Some(bytes) = self.tail.get(..2).and_then(|s| s.try_into().ok()) {
           self.tail = &self.tail[2..];
           self.val_ |= (u16::from_le_bytes(bytes) as reg_t) << 16;
+        } else {
+          debug_assert!(false, "BrotliFastBitReader::read_bits past the end of the input");
         }
         let high_val = self.take_bits(n_bits - 16);
         low_val | (high_val << 16)
