@@ -1160,9 +1160,9 @@ macro_rules! SafeReadBlockLength (
 // To reduce the cost of initialization, we reuse L, remember the upper bound
 // of Y values, and reinitialize only first elements in L.
 //
-// Most of input values are 0 and 1. To reduce number of branches, we replace
-// inner for loop with do-while.
-//
+// Most input values are 0, so a `while index > 0` loop skips the shift when
+// `index == 0`. Masking with `& 0xff` proves to the compiler that every access
+// to the 256-entry `mtf` array is in bounds.
 fn InverseMoveToFrontTransform(v: &mut [u8],
                                v_len: u32,
                                mtf: &mut [u8;256],
@@ -2915,8 +2915,6 @@ mod tests {
   }
 }
 
-// Allocates the block type and block length trees unless they already are.
-// Returns false if an allocation fails.
 // The table for decoding context maps, needed only by metablocks with more
 // than one tree in a group.
 fn EnsureContextMapTable<AllocU8: alloc::Allocator<u8>,
@@ -2930,8 +2928,10 @@ fn EnsureContextMapTable<AllocU8: alloc::Allocator<u8>,
   s.context_map_table.slice().len() != 0
 }
 
-// Also allocates the context map table: the callers allocate everything a
-// later metablock may need before anything is freed.
+// Allocates the context-map table, block-type trees, and block-length trees
+// unless they are already allocated. Returns false if an allocation fails.
+// Callers invoke this before freeing/growing any reusable metablock buffer so
+// fixed pool allocators never see an allocation after a free.
 fn EnsureBlockTrees<AllocU8: alloc::Allocator<u8>,
                     AllocU32: alloc::Allocator<u32>,
                     AllocHC: alloc::Allocator<HuffmanCode>>
@@ -3072,28 +3072,42 @@ pub fn ReadDistanceInternal<AllocU8: alloc::Allocator<u8>,
       fast_mut!((s.block_type_length_state.block_length)[2]) -= 1;
       return true;
     }
-    distval = s.distance_code - s.num_direct_distance_codes as i32;
-    if (distval >= 0) {
-      if (s.distance_postfix_bits == 0) {
-        let nbits = (distval as u32 >> 1) + 1;
-        let offset = ((((distval & 1) as u32).wrapping_add(2)) << nbits).wrapping_sub(4);
-        s.distance_code = s.num_direct_distance_codes
-          .wrapping_add(offset)
-          .wrapping_add(br.read_bits(nbits)) as i32;
-      } else {
-        let postfix = distval & s.distance_postfix_mask;
-        distval >>= s.distance_postfix_bits;
-        let nbits = (distval as u32 >> 1) + 1;
-        let bits = br.read_bits(nbits);
-        let offset = ((((distval & 1) as u32).wrapping_add(2)) << nbits).wrapping_sub(4);
-        s.distance_code = offset
-          .wrapping_add(bits)
-          .wrapping_shl(s.distance_postfix_bits)
-          .wrapping_add(postfix as u32)
-          .wrapping_add(s.num_direct_distance_codes) as i32;
-      }
+    // Fast path for the common `npostfix == 0 && ndirect == 0` case (all q0-q9
+    // metablocks): the condition is invariant across the metablock so the
+    // branch predictor sees 0 mispredictions, `code >= 16` is already
+    // guaranteed, `(code - 16) >> 1 + 1` simplifies to `(code >> 1) - 7`, and
+    // `+ 16 - 4 - 16 + 1` folds into `- 3`.
+    if (s.distance_postfix_bits | (s.num_direct_distance_codes ^ (NUM_DISTANCE_SHORT_CODES as u32))) == 0 {
+      let code = s.distance_code as u32;
+      let nbits = (code >> 1).wrapping_sub(7);
+      let bits = br.read_bits(nbits);
+      let offset = ((2 + (code & 1)) << nbits).wrapping_sub(3);
+      s.distance_code = offset.wrapping_add(bits) as i32;
+      fast_mut!((s.block_type_length_state.block_length)[2]) -= 1;
+      return true;
     }
-    s.distance_code = s.distance_code.wrapping_sub(NUM_DISTANCE_SHORT_CODES as i32).wrapping_add(1);
+    distval = s.distance_code - s.num_direct_distance_codes as i32;
+    // When `ndirect > 0` or `npostfix > 0` (q10-q11), compute the extra-bit
+    // count and distance offset branchlessly so mixed direct (`distval < 0`)
+    // and extra-bit (`distval >= 0`) distance codes do not mispredict on
+    // `distval >= 0`. When `distval < 0`, `mask == 0`, `nbits == 0`
+    // (`br.read_bits(0)` consumes 0 bits and returns 0), and `raw_dist`
+    // selects `s.distance_code`.
+    let mask = !(distval >> 31) as u32;
+    let udist = ((distval as u32) & mask) >> s.distance_postfix_bits;
+    let nbits = ((udist >> 1) + 1) & mask;
+    let bits = br.read_bits(nbits);
+    let postfix = (distval as u32) & (s.distance_postfix_mask as u32);
+    let extra_dist = (((2 + (udist & 1)) << nbits)
+      .wrapping_sub(4)
+      .wrapping_add(bits))
+      .wrapping_shl(s.distance_postfix_bits)
+      .wrapping_add(postfix)
+      .wrapping_add(s.num_direct_distance_codes);
+    let raw_dist = (extra_dist & mask) | ((s.distance_code as u32) & !mask);
+    s.distance_code = raw_dist
+      .wrapping_sub(NUM_DISTANCE_SHORT_CODES as u32)
+      .wrapping_add(1) as i32;
     fast_mut!((s.block_type_length_state.block_length)[2]) -= 1;
     return true;
   } else {
@@ -3270,6 +3284,10 @@ fn memmove16(data: &mut [u8], u32off_dst: u32, u32off_src: u32) -> bool {
     data[off_dst..dst_end].clone_from_slice(&local_array);
     true
   }
+  // On 32-bit targets (ARMv7), `clone_from_slice` on a 16-byte range emits
+  // panicking slice bounds checks and four 32-bit loads/stores; matching a
+  // 16-element slice prefix lowers to a single unaligned NEON `vld1.8`/`vst1.8`
+  // pair with no panic path.
   #[cfg(not(target_pointer_width = "64"))]
   {
     let local_array: [u8; 16] = match data.get(off_src..) {
@@ -3333,6 +3351,9 @@ fn memcpy_within_slice(data: &mut [u8], off_dst: usize, off_src: usize, size: us
 
   #[cfg(not(feature="unsafe"))]
   {
+    // On 32-bit targets, slicing with `.get(..size)` avoids emitting panicking
+    // slice bounds checks after `split_at_mut`, whereas on 64-bit targets the
+    // direct range indexing below schedules slightly better in `ProcessCommands`.
     #[cfg(not(target_pointer_width = "64"))]
     {
       if off_dst > off_src {
@@ -3502,7 +3523,14 @@ fn tree_entries<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocator<Huffm
 }
 
 // The tree with the given index in a Huffman tree group, as
-// HuffmanTreeGroup::build_hgroup_cache lists them; empty if there is none.
+// `HuffmanTreeGroup::build_hgroup_cache` lists them, or `&EMPTY_LITERAL_TREE[..]`
+// (at least `kHuffmanRootTableSize` zeroed entries) if `index` is out of range.
+//
+// This helper and `distance_root_table` / `literal_huffman_tree` /
+// `command_huffman_tree` below are `inline(always)` on `aarch64` (which has
+// enough general-purpose registers to inline them without spilling hot-loop
+// state) and `inline(never)` on other targets so their slice setup does not
+// increase register pressure in `ProcessCommands`.
 #[cfg_attr(target_arch = "aarch64", inline(always))]
 #[cfg_attr(not(target_arch = "aarch64"), inline(never))]
 fn huffman_tree<AllocU32: alloc::Allocator<u32>, AllocHC: alloc::Allocator<HuffmanCode>>(
@@ -3721,7 +3749,6 @@ fn ProcessCommandsInternal<AllocU8: alloc::Allocator<u8>,
   let mut i: i32 = s.loop_counter; // important that this is signed
   let mut state = core::mem::replace(&mut s.state, BrotliRunningState::BROTLI_STATE_UNINITED);
   let mut result = BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS;
-  let compound_dictionary_size = s.compound_dictionary.total_size as u32;
   let saved_literal_hgroup =
     core::mem::replace(&mut s.literal_hgroup,
                        HuffmanTreeGroup::<AllocU32, AllocHC>::default());
@@ -4153,6 +4180,10 @@ fn ProcessCommandsInternal<AllocU8: alloc::Allocator<u8>,
               result = BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_FORMAT_DISTANCE;
               break;
             }
+            // Read `compound_dictionary.total_size` only on the dictionary path
+            // so it does not occupy a register or stack slot across the hot
+            // LZ77 loop in `ProcessCommands`.
+            let compound_dictionary_size = s.compound_dictionary.total_size as u32;
             // Distances in (max_distance, max_distance + compound_dictionary_size]
             // address the attached compound dictionary, furthest byte first.
             if (s.distance_code - s.max_distance) as u32 <= compound_dictionary_size {
@@ -5094,6 +5125,9 @@ pub fn BrotliDecompressStreamWithDictionaryAndMetadata<AllocU8: alloc::Allocator
             break;
           }
           if (s.is_last_metablock == 0) {
+            // Keep `context_modes`, `context_map`, `dist_context_map`, and the
+            // Huffman tree groups allocated so the next metablock can reuse
+            // their buffers when they are large enough.
             s.state = BrotliRunningState::BROTLI_STATE_METABLOCK_BEGIN;
             break;
           }

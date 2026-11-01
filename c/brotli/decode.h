@@ -28,8 +28,12 @@ extern "C" {
  */
 typedef struct BrotliDecoderStateStruct BrotliDecoderState;
 
-/* Match Rust's #[repr(C, align(4))] layout. Aligning the first member also
-   aligns arrays and embedded buffers without changing the field offsets. */
+/* Match Rust's `#[repr(C, align(4))]` `HuffmanCode` layout in `src/huffman/mod.rs`.
+   Aligning the first member also aligns arrays and embedded buffers without
+   changing the field offsets. On 64-bit targets `value` is at offset 0 and
+   `bits` at offset 2; on 32-bit targets `bits` is placed in the low byte and
+   `value` in the upper 16 bits (matching C's `BROTLI_HUFFMAN_CODE_FAST_LOAD`)
+   so a single 32-bit load extracts `bits` via `uxtb` and `value` via `lsr #16`. */
 typedef struct HuffmanCodeStruct {
 #if defined(__cplusplus) && __cplusplus >= 201103L
     alignas(4)

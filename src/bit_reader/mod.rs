@@ -185,11 +185,12 @@ pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) 
   BrotliFillBitWindowCompileTimeNbits(br, n_bits, input);
 }
 
+#[cold]
+#[inline(always)]
+fn cold_bit_reader_path() {}
+
 #[inline(always)]
 fn BrotliFillBitWindowCompileTimeNbits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) {
-  // The 32-bit register always refills 16 bits, whatever `n_bits` is.
-  #[cfg(not(target_pointer_width = "64"))]
-  let _ = n_bits;
   if ::core::mem::size_of::<reg_t>() == 8 {
     #[cfg(target_pointer_width = "64")]
     {
@@ -218,6 +219,14 @@ fn BrotliFillBitWindowCompileTimeNbits(br: &mut BrotliBitReader, n_bits: u32, in
         br.avail_in -= BROTLI_SHORT_FILL_BIT_WINDOW_READ;
         br.next_in += BROTLI_SHORT_FILL_BIT_WINDOW_READ;
       }
+    }
+  } else if BROTLI_ALIGNED_READ == 0 && n_bits <= 8 {
+    if br.bit_pos_ >= 24 {
+      br.val_ >>= 24;
+      br.bit_pos_ &= 7;  /* here same as -= 24 because 24 <= br.bit_pos_ < 32 */
+      br.val_ |= (BrotliLoad32LE(input, br.next_in) as reg_t) << 8;
+      br.avail_in -= 3;
+      br.next_in += 3;
     }
   } else if br.bit_pos_ >= 16 {
       let next = BrotliLoad16LE(input, br.next_in) as reg_t;
@@ -345,6 +354,7 @@ pub fn BrotliReadBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) -> u3
     BrotliTakeBits(br, n_bits, &mut val);
     val
   } else {
+    cold_bit_reader_path();
     let mut low_val: u32 = 0;
     let mut high_val: u32 = 0;
     BrotliFillBitWindowCompileTimeNbits(br, 16, input);
@@ -511,7 +521,6 @@ pub struct BrotliFastBitReader<'a> {
   pub val_: reg_t,
   pub bit_pos_: u32,
   tail: &'a [u8],
-  start_len: usize,
 }
 
 impl<'a> BrotliFastBitReader<'a> {
@@ -526,19 +535,21 @@ impl<'a> BrotliFastBitReader<'a> {
       val_: br.val_,
       bit_pos_: br.bit_pos_,
       tail: tail,
-      start_len: tail.len(),
     }
   }
 
   // Writes the state back to `br`, which must be the reader it was created
-  // from.
+  // from. Computing `consumed` from `br.avail_in` rather than storing a
+  // separate `start_len` field in `BrotliFastBitReader` keeps one fewer value
+  // live across `ProcessCommandsInternal` on 32-bit targets.
   #[inline(always)]
   pub fn store(&self, br: &mut BrotliBitReader) {
-    let consumed = (self.start_len - self.tail.len()) as u32;
+    let rem = self.tail.len() as u32;
+    let consumed = br.avail_in.saturating_sub(rem);
     br.val_ = self.val_;
     br.bit_pos_ = self.bit_pos_;
     br.next_in = br.next_in.wrapping_add(consumed);
-    br.avail_in = br.avail_in.wrapping_sub(consumed);
+    br.avail_in = rem;
   }
 
   // Bytes of input not yet loaded into the register; the same as
@@ -583,8 +594,24 @@ impl<'a> BrotliFastBitReader<'a> {
     }
     #[cfg(not(target_pointer_width = "64"))]
     {
-      let _ = n_bits;
-      if self.bit_pos_ >= 16 {
+      // Like C's 32-bit `BrotliFillBitWindow`, when the caller needs at most
+      // 8 bits (such as `FastPreloadSymbol` in the literal loop), wait until
+      // 24 bits have been consumed and refill 3 bytes at once via a 32-bit
+      // unaligned load, cutting literal-loop refills by a third.
+      if n_bits <= 8 {
+        if self.bit_pos_ >= 24 {
+          self.val_ >>= 24;
+          // For `24 <= bit_pos_ < 32`, `& 7` is identical to `-= 24` (`^= 24`),
+          // and also proves `bit_pos_ < 24 < 32` across both arms of the `if`.
+          // On 32-bit ARM (`lsr` masks shift counts by 255, not 31), that lets
+          // LLVM elide the `and Rs, Rs, #31` shift mask before `val_ >> bit_pos_`.
+          self.bit_pos_ &= 7;
+          if let Some(bytes) = self.tail.get(..4).and_then(|s| s.try_into().ok()) {
+            self.tail = &self.tail[3..];
+            self.val_ |= (u32::from_le_bytes(bytes) as reg_t) << 8;
+          }
+        }
+      } else if self.bit_pos_ >= 16 {
         self.val_ >>= 16;
         self.bit_pos_ &= 15;
         if let Some(bytes) = self.tail.get(..2).and_then(|s| s.try_into().ok()) {
@@ -637,6 +664,7 @@ impl<'a> BrotliFastBitReader<'a> {
       if n_bits <= 16 {
         self.take_bits(n_bits)
       } else {
+        cold_bit_reader_path();
         use core::convert::TryInto;
         let low_val = self.get_bits_unmasked() as u16 as u32;
         self.val_ >>= 16;

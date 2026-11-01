@@ -40,10 +40,12 @@ pub const BROTLI_HUFFMAN_MAX_SIZE_258: u32 = 632;
 pub const BROTLI_HUFFMAN_MAX_SIZE_272: u32 = 646;
 
 // 4-byte aligned so that a copy, and the fill of a new table, is one 32-bit
-// access rather than separate 16- and 8-bit ones. On 32-bit targets `bits` is
-// placed in the low byte and `value` in the upper 16 bits (matching C's
-// `BROTLI_HUFFMAN_CODE_FAST_LOAD`) so a 32-bit load extracts `bits` via
-// `uxtb`/`uxtab` and `value` via `lsr #16`.
+// access rather than separate 16- and 8-bit ones. On 64-bit targets `value` is
+// kept at offset 0 and `bits` at offset 2 (which produces faster codegen on
+// x86-64 and aarch64). On 32-bit targets `bits` is placed in the low byte and
+// `value` in the upper 16 bits (matching C's `BROTLI_HUFFMAN_CODE_FAST_LOAD`)
+// so a single 32-bit load extracts `bits` via `uxtb`/`uxtab` and `value` via
+// `lsr #16`. Keep `HuffmanCodeStruct` in `c/brotli/decode.h` in sync.
 #[repr(C, align(4))]
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub struct HuffmanCode {
@@ -252,12 +254,14 @@ fn BrotliReverseBits(num: u8) -> u32 {
   num.reverse_bits() as u32
 }
 
-// Stores code in table[0], table[step], table[2*step], ..., table[end]
-// Assumes that end is an integer multiple of step.
+// Stores `code` in `table[offset]`, `table[offset + step]`, ...,
+// `table[offset + end - step]`.
+// Assumes that `end` is a positive integer multiple of `step`.
 //
-// The written extent is table[offset .. offset + end], so bounds-checking the
-// last index covers the whole loop. That check is what makes the `fast_mut!`
-// write sound under --features=unsafe, where it is an unchecked store.
+// `step` is always a power of two (`1 << bits`) in valid callers; testing the
+// power-of-two case with a bitmask avoids emitting a division instruction on
+// 32-bit targets. Slicing `table[offset ..= offset + end - step]` up front
+// bounds-checks the whole written extent once before the loop.
 #[inline(always)]
 fn ReplicateValue(table: &mut [HuffmanCode],
                   offset: u32,
@@ -314,11 +318,12 @@ fn NextTableBitSize(count: &[u16], mut len: i32, root_bits: i32) -> Option<i32> 
   Some(len - root_bits)
 }
 
-// symbol_lists is indexed relative to symbol_lists_offset, and the relative
+// `symbol_lists` is indexed relative to `symbol_lists_offset`, and the relative
 // index is deliberately negative for the per-length list heads (the reference
-// implementation indexes backwards off a raw pointer here). i64 covers both
-// directions in one expression, but we need to check if the resulting index
-// lands in the slice
+// implementation indexes backwards off a raw pointer here). Wrapping addition
+// in `isize` cast to `usize` maps negative out-of-bounds indices above
+// `isize::MAX as usize`, so a single `symbol_lists.get(index)` check covers
+// both directions without 64-bit arithmetic on 32-bit targets.
 #[inline(always)]
 fn symbol_list_value(symbol_lists: &[u16],
                      symbol_lists_offset: usize,

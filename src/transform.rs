@@ -822,8 +822,8 @@ mod tests {
   use super::{copy_bytes, kNumTransforms, kPrefixSuffix, kTransforms, kOmitFirst1, kOmitLast9,
               kUppercaseAll, kUppercaseFirst, ToUpperCase, TransformDictionaryWord};
 
-  // TransformDictionaryWord as it was written before it copied whole slices:
-  // byte by byte, scanning the prefix and the suffix for their terminators.
+  // `TransformDictionaryWord` as it was written before it copied the word
+  // slice with `copy_bytes`: copying the word byte by byte.
   fn reference(dst: &mut [u8], mut word: &[u8], mut len: i32, transform: i32) -> i32 {
     let mut idx: i32 = 0;
     let prefix = &kPrefixSuffix[kTransforms[transform as usize].prefix_id as usize..];
