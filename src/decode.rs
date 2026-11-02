@@ -2886,7 +2886,8 @@ pub fn SafeReadBits(br: &mut bit_reader::BrotliBitReader,
 
 // Precondition: *distance_code < 0
 #[inline(always)]
-fn read_distance<const SAFE: bool>(
+fn read_distance(
+  safe: bool,
   fbr: &mut bit_reader::BitReaderSlice,
   br: &mut bit_reader::BrotliBitReader,
   input: &[u8],
@@ -2900,12 +2901,12 @@ fn read_distance<const SAFE: bool>(
   num_direct_distance_codes: u32,
   distance_tree: &[HuffmanCode],
 ) -> bool {
-  let memento = if SAFE {
+  let memento = if safe {
     bit_reader::BrotliBitReaderSaveState(br)
   } else {
     bit_reader::BrotliBitReaderState::default()
   };
-  let code = if !SAFE {
+  let code = if !safe {
     read_symbol_slice(fbr, distance_tree) as usize
   } else {
     let mut sym: u32 = 0;
@@ -2932,7 +2933,7 @@ fn read_distance<const SAFE: bool>(
   let postfix = distval & (distance_postfix_mask as u32);
   let hcode = distval >> distance_postfix_bits;
   let nbits = (hcode >> 1) + 1;
-  let bits = if !SAFE {
+  let bits = if !safe {
     fbr.read_bits(nbits)
   } else {
     if nbits > 29 {
@@ -2960,7 +2961,8 @@ fn read_distance<const SAFE: bool>(
 }
 
 #[inline(always)]
-fn read_command<const SAFE: bool>(
+fn read_command(
+  safe: bool,
   fbr: &mut bit_reader::BitReaderSlice,
   br: &mut bit_reader::BrotliBitReader,
   input: &[u8],
@@ -2971,12 +2973,12 @@ fn read_command<const SAFE: bool>(
   insert_length: &mut i32,
   insert_copy_tree: &InsertCopyTable,
 ) -> bool {
-  let memento = if SAFE {
+  let memento = if safe {
     bit_reader::BrotliBitReaderSaveState(br)
   } else {
     bit_reader::BrotliBitReaderState::default()
   };
-  let cmd_code = if !SAFE {
+  let cmd_code = if !safe {
     read_symbol_slice(fbr, insert_copy_tree) as usize
   } else {
     let mut sym: u32 = 0;
@@ -2997,7 +2999,7 @@ fn read_command<const SAFE: bool>(
   let mut insert_len = v.insert_len_offset as i32;
   if v.insert_len_extra_bits != 0 {
     mark_unlikely();
-    let extra = if !SAFE {
+    let extra = if !safe {
       fbr.read_bits(v.insert_len_extra_bits as u32)
     } else {
       let mut bits = 0u32;
@@ -3009,7 +3011,7 @@ fn read_command<const SAFE: bool>(
     };
     insert_len += extra as i32;
   }
-  let copy_extra = if !SAFE {
+  let copy_extra = if !safe {
     fbr.read_bits(v.copy_len_extra_bits as u32)
   } else {
     let mut bits = 0u32;
@@ -3301,17 +3303,12 @@ fn decode_literal_batch<'b>(
   } else {
     let start = pos.wrapping_sub(2);
     let len = count + 2;
-    let Some([p2_init, p1_init, ref mut ring_window @ ..]) =
-      rb.get_mut(start..).and_then(|w| w.get_mut(..len))
-    else {
-      return (fbr, LiteralBatchStatus::NotHandled);
-    };
-    let Some((lut0, rest)) = context_lookup.split_first_chunk::<256>() else {
-      return (fbr, LiteralBatchStatus::NotHandled);
-    };
-    let Some((lut1, _)) = rest.split_first_chunk::<256>() else {
-      return (fbr, LiteralBatchStatus::NotHandled);
-    };
+    let (p2_init, p1_init, ring_window) =
+      match rb.get_mut(start..).and_then(|w| w.get_mut(..len)) {
+        Some([p2_init, p1_init, ref mut ring_window @ ..]) => (p2_init, p1_init, ring_window),
+        _ => return (fbr, LiteralBatchStatus::NotHandled),
+      };
+    let (lut0, lut1) = context_lookup.split_at(256);
     let mut p1: u8 = *p1_init;
     let mut p2: u8 = *p2_init;
     for dst in ring_window.iter_mut() {
@@ -3491,25 +3488,27 @@ fn save_mid_command_state<AllocU8: alloc::Allocator<u8>,
   }
 }
 
-// Unified command loop parameterized over `const SAFE: bool`:
-// - `SAFE = false`: entered from `COMMAND_BEGIN` with `>= 28` input bytes,
+// Unified command loop for both values of `safe`, which every caller passes
+// as a constant, so the `#[inline(always)]` body is specialized for each
+// (a `const` generic parameter would need Rust 1.51):
+// - `safe = false`: entered from `COMMAND_BEGIN` with `>= 28` input bytes,
 //   compiling to a single-entry loop over `BitReaderSlice` with in-place
 //   `HuffmanTreeGroup` borrows.
-// - `SAFE = true`: streaming/tail fallback handling arbitrary command entry
+// - `safe = true`: streaming/tail fallback handling arbitrary command entry
 //   states, `< 28`-byte input tails, and single-command resumption.
 #[inline(always)]
 fn ProcessCommandsInternal<
-  const SAFE: bool,
   AllocU8: alloc::Allocator<u8>,
   AllocU32: alloc::Allocator<u32>,
   AllocHC: alloc::Allocator<HuffmanCode>,
 >(
+  safe: bool,
   single_command: bool,
   s: &mut BrotliState<AllocU8, AllocU32, AllocHC>,
   input: &[u8],
   dictionary: &[u8],
 ) -> BrotliDecoderErrorCode {
-  if SAFE {
+  if safe {
     if (!CheckInputAmount(true, &s.br, 28)) || (!WarmupBitReader(true, &mut s.br, input)) {
       mark_unlikely();
       return BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT;
@@ -3529,18 +3528,18 @@ fn ProcessCommandsInternal<
   let rb_size = s.ringbuffer_size;
   let rb_mask = s.ringbuffer_mask;
   let mut pos = s.pos;
-  if !SAFE && (rb_size < 2 || (rb_size & (rb_size - 1)) != 0 || rb_mask != rb_size - 1 || pos < 0) {
+  if !safe && (rb_size < 2 || (rb_size & (rb_size - 1)) != 0 || rb_mask != rb_size - 1 || pos < 0) {
     mark_unlikely();
     return BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_UNREACHABLE;
   }
   let rb_mask_usize = (rb_mask as usize) & 0x7fff_ffff;
   let min_rb_len = rb_mask_usize + kRingBufferAllocationSlack;
-  if !SAFE && (pos >= rb_size || s.ringbuffer.slice().len() < min_rb_len) {
+  if !safe && (pos >= rb_size || s.ringbuffer.slice().len() < min_rb_len) {
     mark_unlikely();
     return SafeProcessCommands(s, input, dictionary);
   }
 
-  let mut fbr = if !SAFE {
+  let mut fbr = if !safe {
     match bit_reader::BitReaderSlice::new(&s.br, input) {
       Some(r) => r,
       None => {
@@ -3551,7 +3550,7 @@ fn ProcessCommandsInternal<
   } else {
     bit_reader::BitReaderSlice::empty()
   };
-  let rb: &mut [u8] = if !SAFE {
+  let rb: &mut [u8] = if !safe {
     match s.ringbuffer.slice_mut().get_mut(..min_rb_len) {
       Some(r) => r,
       None => {
@@ -3569,7 +3568,7 @@ fn ProcessCommandsInternal<
   let mut context_trees_slice: Option<usize> = None;
   let mut distance_tree_index = s.dist_htree_index;
   let mut distance_tree = huffman_tree(&s.distance_hgroup, distance_tree_index as usize);
-  if !SAFE && s.trivial_literal_context == 0 {
+  if !safe && s.trivial_literal_context == 0 {
     fill_context_trees(
       &mut context_trees,
       &s.literal_hgroup,
@@ -3580,12 +3579,12 @@ fn ProcessCommandsInternal<
   }
   let distance_postfix_bits = s.distance_postfix_bits & 3;
 
-  let mut state = if SAFE {
+  let mut state = if safe {
     core::mem::replace(&mut s.state, BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN)
   } else {
     BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN
   };
-  if SAFE
+  if safe
     && !matches!(
       state,
       BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN
@@ -3597,31 +3596,31 @@ fn ProcessCommandsInternal<
     s.state = state;
     return BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_UNREACHABLE;
   }
-  let mut i: i32 = if SAFE { s.loop_counter } else { 0 };
-  let mut distance_code: i32 = if SAFE { s.distance_code } else { 0 };
-  let mut distance_context: i32 = if SAFE { s.distance_context } else { 0 };
-  let mut copy_length: i32 = if SAFE { s.copy_length } else { 0 };
+  let mut i: i32 = if safe { s.loop_counter } else { 0 };
+  let mut distance_code: i32 = if safe { s.distance_code } else { 0 };
+  let mut distance_context: i32 = if safe { s.distance_context } else { 0 };
+  let mut copy_length: i32 = if safe { s.copy_length } else { 0 };
 
   let mut exit_state = BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN;
   let mut result = BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS;
   let mut mid_cmd: Option<(i32, i32, i32, i32)> = None;
 
   'cmd: loop {
-    if !SAFE {
+    if !safe {
       i = 0;
       distance_code = 0;
       distance_context = 0;
       copy_length = 0;
     }
-    if !SAFE || matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN) {
-      if !SAFE && !fbr.has_input() {
+    if !safe || matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN) {
+      if !safe && !fbr.has_input() {
         mark_unlikely();
         result = BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT;
         break 'cmd;
       }
       if s.block_type_length_state.block_length[1] == 0 {
         mark_unlikely();
-        let status = if !SAFE {
+        let status = if !safe {
           let st = decode_block_type_and_length_slice(&mut s.block_type_length_state, &mut fbr, 1);
           if matches!(st, BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS) {
             s.htree_command_index = s.block_type_length_state.block_type_rb[3] as u16;
@@ -3649,7 +3648,8 @@ fn ProcessCommandsInternal<
         continue 'cmd;
       }
 
-      if !read_command::<SAFE>(
+      if !read_command(
+        safe,
         &mut fbr,
         &mut s.br,
         input,
@@ -3661,7 +3661,7 @@ fn ProcessCommandsInternal<
         insert_copy_tree,
       ) {
         mark_unlikely();
-        result = if SAFE {
+        result = if safe {
           BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT
         } else {
           BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_UNREACHABLE
@@ -3669,7 +3669,7 @@ fn ProcessCommandsInternal<
         break 'cmd;
       }
 
-      if SAFE {
+      if safe {
         if i == 0 {
           state = BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS;
         } else {
@@ -3681,9 +3681,9 @@ fn ProcessCommandsInternal<
       }
     }
 
-    if (!SAFE && i != 0) || (SAFE && matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_INNER)) {
+    if (!safe && i != 0) || (safe && matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_INNER)) {
       'inner: loop {
-        if !SAFE {
+        if !safe {
           let i_u32 = i as u32;
           let block_len = s.block_type_length_state.block_length[0];
           let mut handled = false;
@@ -3718,14 +3718,14 @@ fn ProcessCommandsInternal<
           mark_unlikely();
         }
 
-        let mut p1: u8 = if !SAFE {
+        let mut p1: u8 = if !safe {
           rb[(pos.wrapping_sub(1) as usize) & rb_mask_usize]
         } else if rb.is_empty() {
           0
         } else {
           fast!((rb)[((pos - 1) & rb_mask) as usize])
         };
-        let mut p2: u8 = if !SAFE {
+        let mut p2: u8 = if !safe {
           rb[(pos.wrapping_sub(2) as usize) & rb_mask_usize]
         } else if rb.is_empty() {
           0
@@ -3733,14 +3733,14 @@ fn ProcessCommandsInternal<
           fast!((rb)[((pos - 2) & rb_mask) as usize])
         };
         loop {
-          if !SAFE && !fbr.has_input() {
+          if !safe && !fbr.has_input() {
             exit_state = BrotliRunningState::BROTLI_STATE_COMMAND_INNER;
             mid_cmd = Some((i, distance_code, distance_context, copy_length));
             result = BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT;
             break 'cmd;
           }
           if s.block_type_length_state.block_length[0] == 0 {
-            if !SAFE {
+            if !safe {
               mark_unlikely();
               let status = if !fbr.has_input() {
                 BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT
@@ -3812,7 +3812,7 @@ fn ProcessCommandsInternal<
           }
           let hc = if s.trivial_literal_context != 0 {
             literal_htree
-          } else if !SAFE {
+          } else if !safe {
             let context = (s.context_lookup[p1 as usize] | s.context_lookup[p2 as usize | 256]) as usize;
             context_trees[context & 63]
           } else {
@@ -3820,7 +3820,7 @@ fn ProcessCommandsInternal<
             let idx = fast_slice!((s.context_map)[s.context_map_slice_index + (context & 63)]);
             huffman_window(&s.literal_hgroup, idx as usize)
           };
-          let lit = if !SAFE {
+          let lit = if !safe {
             read_symbol_slice(&mut fbr, hc) as u8
           } else {
             let mut sym = 0u32;
@@ -3834,7 +3834,7 @@ fn ProcessCommandsInternal<
           };
           p2 = p1;
           p1 = lit;
-          if !SAFE {
+          if !safe {
             rb[(pos as usize) & rb_mask_usize] = lit;
           } else {
             fast_mut!((rb)[pos as usize]) = lit;
@@ -3857,12 +3857,12 @@ fn ProcessCommandsInternal<
         exit_state = BrotliRunningState::BROTLI_STATE_METABLOCK_DONE;
         break 'cmd;
       }
-      if SAFE {
+      if safe {
         state = BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS;
       }
     }
 
-    if !SAFE || matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS) {
+    if !safe || matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS) {
       if distance_code >= 0 {
         distance_context = if distance_code != 0 { 0 } else { 1 };
         s.dist_rb_idx -= 1;
@@ -3870,7 +3870,7 @@ fn ProcessCommandsInternal<
       } else {
         if s.block_type_length_state.block_length[2] == 0 {
           mark_unlikely();
-          let status = if !SAFE {
+          let status = if !safe {
             if !fbr.has_input() {
               BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT
             } else {
@@ -3900,7 +3900,8 @@ fn ProcessCommandsInternal<
           distance_tree_index = idx;
           distance_tree = huffman_tree(&s.distance_hgroup, idx as usize);
         }
-        if !read_distance::<SAFE>(
+        if !read_distance(
+          safe,
           &mut fbr,
           &mut s.br,
           input,
@@ -3964,7 +3965,7 @@ fn ProcessCommandsInternal<
               exit_state = BrotliRunningState::BROTLI_STATE_METABLOCK_DONE;
               break 'cmd;
             }
-            if SAFE {
+            if safe {
               state = BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN;
               if single_command {
                 break 'cmd;
@@ -3987,7 +3988,7 @@ fn ProcessCommandsInternal<
       let dst_start = (pos as usize) & rb_mask_usize;
       let src_start_u32 = src_start as u32;
       let dst_start_u32 = pos as u32;
-      if !SAFE {
+      if !safe {
         let mut tmp16 = [0u8; 16];
         tmp16.copy_from_slice(&rb[src_start..src_start + 16]);
         rb[dst_start..dst_start + 16].copy_from_slice(&tmp16);
@@ -4004,7 +4005,7 @@ fn ProcessCommandsInternal<
         || src_end >= rb_size_u32
       {
         mark_unlikely();
-        if SAFE {
+        if safe {
           state = BrotliRunningState::BROTLI_STATE_COMMAND_POST_WRAP_COPY;
         } else {
           let (next_pos, next_i, wrapped) =
@@ -4022,7 +4023,7 @@ fn ProcessCommandsInternal<
         if i > 16 {
           let copy_ok = if i > 32 {
             memcpy_within_slice(rb, dst_start + 16, src_start + 16, (i - 16) as usize)
-          } else if !SAFE {
+          } else if !safe {
             let mut tmp16 = [0u8; 16];
             tmp16.copy_from_slice(&rb[src_start + 16..src_start + 32]);
             rb[dst_start + 16..dst_start + 32].copy_from_slice(&tmp16);
@@ -4039,7 +4040,7 @@ fn ProcessCommandsInternal<
       }
     }
 
-    if SAFE && matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_POST_WRAP_COPY) {
+    if safe && matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_POST_WRAP_COPY) {
       let (next_pos, next_i, wrapped) =
         copy_wrap_or_overlapping(rb, rb_size, rb_mask, pos, i, distance_code);
       pos = next_pos;
@@ -4056,7 +4057,7 @@ fn ProcessCommandsInternal<
       exit_state = BrotliRunningState::BROTLI_STATE_METABLOCK_DONE;
       break 'cmd;
     }
-    if SAFE {
+    if safe {
       state = BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN;
       if single_command {
         break 'cmd;
@@ -4064,7 +4065,7 @@ fn ProcessCommandsInternal<
     }
   }
 
-  if !SAFE {
+  if !safe {
     fbr.sync_to(&mut s.br);
   }
   s.state = exit_state;
@@ -4102,7 +4103,7 @@ fn ProcessCommands<AllocU8: alloc::Allocator<u8>,
       return BrotliDecoderErrorCode::BROTLI_DECODER_NEEDS_MORE_INPUT;
     }
   }
-  ProcessCommandsInternal::<false, _, _, _>(false, s, input, dictionary)
+  ProcessCommandsInternal(false, false, s, input, dictionary)
 }
 
 #[inline(never)]
@@ -4114,7 +4115,7 @@ fn SafeProcessCommandsEntry<AllocU8: alloc::Allocator<u8>,
    input: &[u8],
    dictionary: &[u8])
    -> BrotliDecoderErrorCode {
-  ProcessCommandsInternal::<true, _, _, _>(single_command, s, input, dictionary)
+  ProcessCommandsInternal(true, single_command, s, input, dictionary)
 }
 
 #[inline(always)]

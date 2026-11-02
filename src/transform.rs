@@ -886,7 +886,10 @@ mod tests {
 
   #[test]
   fn copy_bytes_copies_every_length() {
-    let source: [u8; 40] = core::array::from_fn(|i| (i * 7 + 1) as u8);
+    let mut source = [0u8; 40];
+    for (i, b) in source.iter_mut().enumerate() {
+      *b = (i * 7 + 1) as u8;
+    }
     for len in 0..=source.len() {
       let mut dst = [0u8; 48];
       copy_bytes(&mut dst[3..3 + len], &source[..len]);
